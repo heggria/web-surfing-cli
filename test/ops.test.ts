@@ -14,8 +14,11 @@ import * as searchOp from "../src/ops/search.js";
 
 function withFakeFetch<T>(handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>, fn: () => Promise<T>): Promise<T> {
   const orig = globalThis.fetch;
-  globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) =>
-    Promise.resolve(handler(typeof input === "string" ? input : (input as Request).url ?? String(input), init));
+  const fake = ((input: string | URL | Request, init?: RequestInit) =>
+    Promise.resolve(
+      handler(typeof input === "string" ? input : (input as Request).url ?? String(input), init),
+    )) as unknown as typeof fetch;
+  globalThis.fetch = fake;
   return fn().finally(() => {
     globalThis.fetch = orig;
   });

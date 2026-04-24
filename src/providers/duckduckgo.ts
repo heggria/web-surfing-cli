@@ -1,11 +1,16 @@
 /**
- * DuckDuckGo — zero-key fallback search via the lite HTML endpoint.
- * Always degraded: results lack scores, HTML structure may shift.
+ * DuckDuckGo — zero-key fallback search via the HTML endpoint.
+ * Always degraded: results lack scores, HTML structure may shift, and DDG
+ * actively fingerprints non-browser clients (POST and bare UAs get a 202
+ * challenge page, GET with a real browser UA gets the real results).
  */
 
 import { NormalizedResult, Provider, httpRequest } from "./base.js";
 
-export const LITE_ENDPOINT = "https://html.duckduckgo.com/html/";
+export const ENDPOINT = "https://duckduckgo.com/html/";
+
+const BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
 const RESULT_RE = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
 const SNIPPET_RE = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -49,10 +54,17 @@ export class DuckDuckGoProvider extends Provider {
   }
 
   async search(query: string, opts: { count?: number; timeoutMs?: number } = {}): Promise<NormalizedResult[]> {
-    const response = await httpRequest(LITE_ENDPOINT, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: `q=${encodeURIComponent(query)}`,
+    const response = await httpRequest(ENDPOINT, {
+      method: "GET",
+      // Browser headers; without these DDG returns a 202 challenge page that
+      // looks like the homepage (no result anchors).
+      headers: {
+        "user-agent": BROWSER_UA,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "identity",
+      },
+      params: { q: query },
       timeoutMs: opts.timeoutMs,
     });
     return this.normalize(response.text ?? "", opts.count ?? 10);

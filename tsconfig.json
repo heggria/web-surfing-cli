@@ -17,7 +17,6 @@
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "outDir": "./dist",
-    "rootDir": "./src",
     "declaration": false,
     "sourceMap": true,
     "noEmit": true

@@ -5366,7 +5366,8 @@ class Context7Provider extends Provider {
 }
 
 // src/providers/duckduckgo.ts
-var LITE_ENDPOINT = "https://html.duckduckgo.com/html/";
+var ENDPOINT2 = "https://duckduckgo.com/html/";
+var BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 var RESULT_RE = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
 var SNIPPET_RE = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
 var TAG_RE = /<[^>]+>/g;
@@ -5401,10 +5402,15 @@ class DuckDuckGoProvider extends Provider {
     super();
   }
   async search(query, opts = {}) {
-    const response = await httpRequest(LITE_ENDPOINT, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: `q=${encodeURIComponent(query)}`,
+    const response = await httpRequest(ENDPOINT2, {
+      method: "GET",
+      headers: {
+        "user-agent": BROWSER_UA,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "identity"
+      },
+      params: { q: query },
       timeoutMs: opts.timeoutMs
     });
     return this.normalize(response.text ?? "", opts.count ?? 10);
@@ -5441,7 +5447,7 @@ class DuckDuckGoProvider extends Provider {
 }
 
 // src/providers/exa.ts
-var ENDPOINT2 = "https://api.exa.ai/search";
+var ENDPOINT3 = "https://api.exa.ai/search";
 
 class ExaProvider extends Provider {
   name = "exa";
@@ -5473,7 +5479,7 @@ class ExaProvider extends Provider {
       body.includeDomains = opts.includeDomains;
     if (opts.excludeDomains)
       body.excludeDomains = opts.excludeDomains;
-    const response = await httpRequest(ENDPOINT2, {
+    const response = await httpRequest(ENDPOINT3, {
       method: "POST",
       headers: { "x-api-key": this.ensureKey() },
       body,
@@ -5658,7 +5664,7 @@ function sleep(ms) {
 }
 
 // src/providers/tavily.ts
-var ENDPOINT3 = "https://api.tavily.com/search";
+var ENDPOINT4 = "https://api.tavily.com/search";
 
 class TavilyProvider extends Provider {
   name = "tavily";
@@ -5690,7 +5696,7 @@ class TavilyProvider extends Provider {
       body.exclude_domains = opts.excludeDomains;
     if (opts.country)
       body.country = opts.country;
-    const response = await httpRequest(ENDPOINT3, { method: "POST", body, timeoutMs: opts.timeoutMs });
+    const response = await httpRequest(ENDPOINT4, { method: "POST", body, timeoutMs: opts.timeoutMs });
     return this.normalize(response.json ?? {});
   }
   normalize(payload) {

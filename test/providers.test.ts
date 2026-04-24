@@ -15,7 +15,7 @@ describe("safeGet", () => {
     expect(base.safeGet({ a: { b: 1 } }, ["a", "missing"], "fb")).toBe("fb");
   });
   test("walks lists", () => {
-    expect(base.safeGet({ r: [{ x: 7 }] }, ["r", 0, "x"])).toBe(7);
+    expect(base.safeGet<number>({ r: [{ x: 7 }] }, ["r", 0, "x"])).toBe(7);
   });
   test("handles undefined root", () => {
     expect(base.safeGet(undefined, ["x"], 42)).toBe(42);
@@ -126,7 +126,7 @@ describe("FirecrawlProvider", () => {
     // fall through to direct unit test of normalizeScrape via scrape()
     // Use a stub provider that overrides scrape for the unit test
     class StubFc extends FirecrawlProvider {
-      override async scrape(): Promise<base.FetchedPage> {
+      override async scrape(_url: string): Promise<base.FetchedPage> {
         return new base.FetchedPage({
           url: "https://example.com/page",
           title: "Title",
@@ -210,8 +210,8 @@ describe("Context7Provider.normalizeSearch", () => {
 // --- HTTP error mapping -----------------------------------------------------
 
 function mockFetch(status: number, body = "", headers: Record<string, string> = {}): typeof fetch {
-  const fakeFetch: typeof fetch = async () =>
-    new Response(body, { status, statusText: `HTTP ${status}`, headers });
+  const fakeFetch = (async () =>
+    new Response(body, { status, statusText: `HTTP ${status}`, headers })) as unknown as typeof fetch;
   return fakeFetch;
 }
 
