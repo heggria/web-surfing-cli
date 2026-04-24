@@ -1,7 +1,8 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "web-surfing-cli",
-  "description": "Routing-policy-driven web research for Claude Code: docs (Context7), semantic discovery (Exa), web facts (Tavily), URL fetch/crawl (Firecrawl), with Brave + DuckDuckGo fallbacks and audit receipts. Wraps the wsc CLI.",
+  "metadata": {
+    "description": "Routing-policy-driven web research for Claude Code: docs (Context7), semantic discovery (Exa), web facts (Tavily), URL fetch/crawl (Firecrawl), with Brave + DuckDuckGo fallbacks and audit receipts. Wraps the wsc CLI."
+  },
   "owner": {
     "name": "heggria"
   },
@@ -9,7 +10,7 @@
     {
       "name": "web-surfing-cli",
       "description": "Slash commands and a routing skill that drive the wsc CLI. Requires the wsc Python CLI installed separately via pipx (run /web-install if missing).",
-      "source": ".",
+      "source": "./",
       "category": "research",
       "homepage": "https://github.com/heggria/web-surfing-cli"
     }
