@@ -7604,7 +7604,7 @@ function resolveIncludeDomains(source, include) {
 }
 
 // src/cli.ts
-var VERSION = "0.2.0";
+var VERSION = "0.3.0";
 function resolveJson(opts) {
   if (opts.json)
     return true;

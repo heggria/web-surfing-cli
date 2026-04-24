@@ -25,7 +25,7 @@ describe("CLI smoke", () => {
   test("--version", () => {
     const r = run(["--version"]);
     expect(r.code).toBe(0);
-    expect(r.out.trim()).toBe("0.2.0");
+    expect(r.out.trim()).toBe("0.3.0");
   });
 
   test("--help lists subcommands", () => {

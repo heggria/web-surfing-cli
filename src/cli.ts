@@ -20,7 +20,7 @@ import * as search from "./ops/search.js";
 import * as verify from "./ops/verify.js";
 import { resolveIncludeDomains } from "./domains.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 interface GlobalOptions {
   json?: boolean;
