@@ -383,12 +383,16 @@ program
   .addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"]))
   .option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10))
   .option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10)
+  .option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) =>
+    Number.parseInt(v, 10),
+  )
   .action(async (query, opts) => {
     const globals = getGlobals();
     const result = await discover.run(query, {
       type: opts.type,
       sinceDays: opts.since,
       numResults: opts.numResults,
+      corroborate: opts.corroborate,
       noReceipt: globals.noReceipt,
       noCache: globals.noCache,
     });
@@ -442,12 +446,16 @@ program
   .option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10)
   .addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"]))
   .option("--country <code>")
+  .option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) =>
+    Number.parseInt(v, 10),
+  )
   .action(async (query, opts) => {
     const globals = getGlobals();
     const result = await search.run(query, {
       maxResults: opts.maxResults,
       timeRange: opts.time,
       country: opts.country,
+      corroborate: opts.corroborate,
       noReceipt: globals.noReceipt,
       noCache: globals.noCache,
     });

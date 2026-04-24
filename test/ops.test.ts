@@ -263,3 +263,86 @@ describe("cache hit on repeat", () => {
     expect(httpCalls).toBe(2);
   });
 });
+
+// --- corroborate (M1) ----------------------------------------------------
+
+describe("search.run with --corroborate (parallel fan-out)", () => {
+  test("fans out to N providers in parallel and merges with multi_source_evidence", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.BRAVE_API_KEY = "brave_test";
+    const seenHosts = new Set<string>();
+    const handler = (url: string) => {
+      seenHosts.add(new URL(url).hostname);
+      if (url.includes("tavily.com")) {
+        return jsonResponse({
+          results: [
+            { url: "https://example.com/x", title: "X (tavily)", content: "from tavily", score: 0.9 },
+            { url: "https://example.com/only-tavily", title: "T-only", content: "...", score: 0.5 },
+          ],
+        });
+      }
+      if (url.includes("brave.com")) {
+        return jsonResponse({
+          web: {
+            results: [
+              { url: "https://example.com/x", title: "X (brave)", description: "from brave" },
+              { url: "https://example.com/only-brave", title: "B-only", description: "..." },
+            ],
+          },
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => searchOp.run("corroborate-test", { corroborate: 2, maxResults: 5 }));
+    expect(out.ok).toBe(true);
+    expect(out.cache_hit).toBe(false);
+    const evidence = out.multi_source_evidence as Array<{ provider: string }>;
+    expect(evidence.length).toBe(2);
+    expect(evidence.map((e) => e.provider).sort()).toEqual(["brave", "tavily"]);
+    // Both providers were hit.
+    expect(seenHosts.has("api.tavily.com")).toBe(true);
+    expect(seenHosts.has("api.search.brave.com")).toBe(true);
+    // The shared URL should be first (higher corroboration count).
+    const results = out.results as Array<Record<string, unknown>>;
+    expect(results.length).toBe(3);
+    expect(results[0]!.url).toBe("https://example.com/x");
+    expect(results[0]!.corroborated_by).toEqual(["brave"]);
+  });
+
+  test("receipt records multi_source_evidence and is queryable via --high-confidence", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.BRAVE_API_KEY = "brave_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({ results: [{ url: "https://a.com", title: "A", content: "...", score: 0.5 }] });
+      }
+      if (url.includes("brave.com")) {
+        return jsonResponse({ web: { results: [{ url: "https://a.com", title: "A", description: "..." }] } });
+      }
+      return jsonResponse({});
+    };
+    await withFakeFetch(handler, () => searchOp.run("hi-conf-test", { corroborate: 2 }));
+    const events = (await audit.tail({ lines: 5 })).events;
+    const last = events[events.length - 1]!;
+    expect(last.op).toBe("search");
+    expect((last.multi_source_evidence as unknown[])?.length).toBe(2);
+    const sum = await audit.summary({ days: 1, highConfidence: true });
+    expect(sum.high_confidence_events?.length).toBeGreaterThan(0);
+  });
+
+  test("only one provider available → degraded status", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    // brave NOT set
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({ results: [{ url: "https://a.com", title: "A", content: "...", score: 0.5 }] });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => searchOp.run("solo-fan", { corroborate: 3 }));
+    expect(out.ok).toBe(true);
+    expect(out.status).toBe("degraded");
+    const evidence = out.multi_source_evidence as Array<unknown>;
+    expect(evidence.length).toBe(1);
+  });
+});

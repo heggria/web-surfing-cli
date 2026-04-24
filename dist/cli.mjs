@@ -5304,6 +5304,7 @@ class NormalizedResult {
   sourceKind;
   provider;
   urlNormalized;
+  corroboratedBy;
   raw;
   constructor(init2) {
     this.url = init2.url;
@@ -5314,6 +5315,7 @@ class NormalizedResult {
     this.sourceKind = init2.sourceKind ?? "web";
     this.provider = init2.provider;
     this.raw = init2.raw;
+    this.corroboratedBy = init2.corroboratedBy ?? [];
     try {
       this.urlNormalized = init2.url ? normalizeUrl(init2.url) : "";
     } catch {
@@ -5331,6 +5333,8 @@ class NormalizedResult {
       provider: this.provider,
       url_normalized: redactUrl(this.urlNormalized)
     };
+    if (this.corroboratedBy.length > 0)
+      d.corroborated_by = this.corroboratedBy;
     if (includeRaw)
       d.raw = this.raw;
     return d;
@@ -6069,6 +6073,108 @@ async function runChain(chain, actions) {
   }
   return { active: null, result: null, fallback };
 }
+async function runChainParallel(chain, actions, opts) {
+  const failures = [];
+  const candidates = [];
+  for (const name of chain) {
+    if (candidates.length >= opts.count)
+      break;
+    if (!actions[name])
+      continue;
+    try {
+      const provider = getProvider(name);
+      candidates.push({ name, provider });
+    } catch (err) {
+      if (err instanceof MissingKeyError || err instanceof DisabledError) {
+        failures.push({ from: name, reason: err.kind });
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (candidates.length === 0) {
+    return { result: [], active: null, participants: [], failures };
+  }
+  const settled = await Promise.allSettled(candidates.map(async ({ name, provider }) => ({
+    provider: name,
+    results: await actions[name](provider)
+  })));
+  const perProvider = [];
+  for (let i = 0;i < settled.length; i++) {
+    const s = settled[i];
+    const cand = candidates[i];
+    if (s.status === "fulfilled") {
+      perProvider.push({ provider: s.value.provider, results: s.value.results ?? [] });
+    } else {
+      const err = s.reason;
+      if (err instanceof RateLimitError || err instanceof TransportError || err instanceof AuthError || err instanceof ProviderError) {
+        failures.push({
+          from: cand.name,
+          reason: err.kind,
+          error: String(err.message ?? err).slice(0, 200)
+        });
+      } else {
+        failures.push({
+          from: cand.name,
+          reason: "transport_error",
+          error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 200) : String(err).slice(0, 200)
+        });
+      }
+    }
+  }
+  if (perProvider.length === 0) {
+    return { result: [], active: null, participants: [], failures };
+  }
+  const seen = new Map;
+  for (const { provider, results } of perProvider) {
+    for (const r of results) {
+      const key = r.urlNormalized || r.url;
+      if (!key)
+        continue;
+      const existing = seen.get(key);
+      if (!existing) {
+        const cloned = new NormalizedResult({
+          url: r.url,
+          title: r.title,
+          snippet: r.snippet,
+          score: r.score,
+          publishedAt: r.publishedAt,
+          sourceKind: r.sourceKind,
+          provider: r.provider,
+          raw: r.raw,
+          corroboratedBy: []
+        });
+        seen.set(key, cloned);
+      } else if (provider !== existing.provider && !existing.corroboratedBy.includes(provider)) {
+        existing.corroboratedBy.push(provider);
+      }
+    }
+  }
+  const merged = [...seen.values()].sort((a, b) => {
+    const ca = a.corroboratedBy.length;
+    const cb = b.corroboratedBy.length;
+    if (cb !== ca)
+      return cb - ca;
+    return (b.score ?? 0) - (a.score ?? 0);
+  });
+  const participants = perProvider.map(({ provider, results }) => ({
+    provider,
+    result_count: results.length,
+    best_score: results.reduce((best, r) => {
+      if (r.score == null)
+        return best;
+      if (best == null || r.score > best)
+        return r.score;
+      return best;
+    }, null)
+  }));
+  return {
+    result: merged,
+    active: perProvider[0].provider,
+    participants,
+    failures
+  };
+}
 async function chainFailedPayload(opName, fallback) {
   return {
     ok: false,
@@ -6180,8 +6286,9 @@ async function run2(query, opts = {}) {
   const category = opts.type ? TYPE_TO_EXA_CATEGORY[opts.type] : undefined;
   const framed = reframeForKeywordSearch(query, opts.type);
   const num = opts.numResults ?? 10;
+  const corroborate = opts.corroborate && opts.corroborate >= 2 ? opts.corroborate : 0;
   const cKey = cacheKey({
-    op: "discover",
+    op: corroborate ? `discover:corroborate-${corroborate}` : "discover",
     query,
     params: { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num }
   });
@@ -6196,7 +6303,12 @@ async function run2(query, opts = {}) {
   const ddgAction = (provider) => provider.search(framed, { count: num });
   return await withCall("discover", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(query));
-    receipt.params = { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num };
+    receipt.params = {
+      type: opts.type ?? null,
+      sinceDays: opts.sinceDays ?? null,
+      numResults: num,
+      corroborate: corroborate || null
+    };
     const cached = await get(cKey, CACHE_TTL_SEC.discover, { noCache: opts.noCache });
     if (cached) {
       receipt.cache_hit = true;
@@ -6205,6 +6317,8 @@ async function run2(query, opts = {}) {
       receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
       receipt.results_count = cached.results.length;
       receipt.selected_count = cached.results.length;
+      if (cached.multi_source_evidence)
+        receipt.multi_source_evidence = cached.multi_source_evidence;
       if (cached.cached_status === "degraded")
         receipt.status = "degraded";
       return {
@@ -6216,6 +6330,50 @@ async function run2(query, opts = {}) {
         fallback_chain: cached.fallback_chain,
         status: cached.cached_status,
         cache_hit: true,
+        multi_source_evidence: cached.multi_source_evidence,
+        returncode: 0
+      };
+    }
+    if (corroborate) {
+      const { result: result2, active: active2, participants, failures } = await runChainParallel(chain, { exa: exaAction, tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
+      receipt.fallback_chain = failures;
+      receipt.cache_hit = false;
+      if (active2 === null) {
+        receipt.status = "error";
+        return await chainFailedPayload("discover", failures);
+      }
+      receipt.provider = active2;
+      receipt.selected_urls = result2.map((r) => r.url);
+      receipt.results_count = result2.length;
+      receipt.selected_count = result2.length;
+      const productive = participants.filter((p) => p.result_count > 0);
+      const multiEvidence = productive.map((p) => ({
+        provider: p.provider,
+        ...p.best_score != null ? { score: p.best_score } : {}
+      }));
+      receipt.multi_source_evidence = multiEvidence;
+      const status2 = productive.length >= 2 ? "ok" : "degraded";
+      if (status2 === "degraded")
+        receipt.status = "degraded";
+      const resultsJson2 = result2.map((r) => r.toJSON());
+      await set(cKey, {
+        provider: active2,
+        results: resultsJson2,
+        fallback_chain: failures,
+        cached_status: status2,
+        multi_source_evidence: multiEvidence
+      }, { ttlSec: CACHE_TTL_SEC.discover, op: "discover:corroborate", provider: active2, noCache: opts.noCache });
+      return {
+        ok: true,
+        operation: "discover",
+        provider: active2,
+        query,
+        results: resultsJson2,
+        fallback_chain: failures,
+        status: status2,
+        cache_hit: false,
+        multi_source_evidence: multiEvidence,
+        participants,
         returncode: 0
       };
     }
@@ -6728,8 +6886,9 @@ var TIME_TO_BRAVE_FRESHNESS = { day: "pd", week: "pw", month: "pm", year: "py" }
 async function run5(query, opts = {}) {
   const chain = filteredChain("web_facts");
   const max = opts.maxResults ?? 10;
+  const corroborate = opts.corroborate && opts.corroborate >= 2 ? opts.corroborate : 0;
   const cKey = cacheKey({
-    op: "search",
+    op: corroborate ? `search:corroborate-${corroborate}` : "search",
     query,
     params: { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null }
   });
@@ -6748,7 +6907,12 @@ async function run5(query, opts = {}) {
   const ddgAction = (provider) => provider.search(query, { count: max });
   return await withCall("search", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(query));
-    receipt.params = { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null };
+    receipt.params = {
+      max_results: max,
+      time_range: opts.timeRange ?? null,
+      country: opts.country ?? null,
+      corroborate: corroborate || null
+    };
     const cached = await get(cKey, CACHE_TTL_SEC.search, { noCache: opts.noCache });
     if (cached) {
       receipt.cache_hit = true;
@@ -6757,6 +6921,8 @@ async function run5(query, opts = {}) {
       receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
       receipt.results_count = cached.results.length;
       receipt.selected_count = cached.results.length;
+      if (cached.multi_source_evidence)
+        receipt.multi_source_evidence = cached.multi_source_evidence;
       if (cached.cached_status === "degraded")
         receipt.status = "degraded";
       return {
@@ -6768,6 +6934,50 @@ async function run5(query, opts = {}) {
         fallback_chain: cached.fallback_chain,
         status: cached.cached_status,
         cache_hit: true,
+        multi_source_evidence: cached.multi_source_evidence,
+        returncode: 0
+      };
+    }
+    if (corroborate) {
+      const { result: result2, active: active2, participants, failures } = await runChainParallel(chain, { tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
+      receipt.fallback_chain = failures;
+      receipt.cache_hit = false;
+      if (active2 === null) {
+        receipt.status = "error";
+        return await chainFailedPayload("search", failures);
+      }
+      receipt.provider = active2;
+      receipt.selected_urls = result2.map((r) => r.url);
+      receipt.results_count = result2.length;
+      receipt.selected_count = result2.length;
+      const productive = participants.filter((p) => p.result_count > 0);
+      const multiEvidence = productive.map((p) => ({
+        provider: p.provider,
+        ...p.best_score != null ? { score: p.best_score } : {}
+      }));
+      receipt.multi_source_evidence = multiEvidence;
+      const status2 = productive.length >= 2 ? "ok" : "degraded";
+      if (status2 === "degraded")
+        receipt.status = "degraded";
+      const resultsJson2 = result2.map((r) => r.toJSON());
+      await set(cKey, {
+        provider: active2,
+        results: resultsJson2,
+        fallback_chain: failures,
+        cached_status: status2,
+        multi_source_evidence: multiEvidence
+      }, { ttlSec: CACHE_TTL_SEC.search, op: "search:corroborate", provider: active2, noCache: opts.noCache });
+      return {
+        ok: true,
+        operation: "search",
+        provider: active2,
+        query,
+        results: resultsJson2,
+        fallback_chain: failures,
+        status: status2,
+        cache_hit: false,
+        multi_source_evidence: multiEvidence,
+        participants,
         returncode: 0
       };
     }
@@ -7157,12 +7367,13 @@ program2.command("docs <library>").description("fetch official library docs via 
   });
   emit(globals, result);
 });
-program2.command("discover <query>").description("semantic discovery via Exa").addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"])).option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10)).option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).action(async (query, opts) => {
+program2.command("discover <query>").description("semantic discovery via Exa").addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"])).option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10)).option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).action(async (query, opts) => {
   const globals = getGlobals();
   const result = await run2(query, {
     type: opts.type,
     sinceDays: opts.since,
     numResults: opts.numResults,
+    corroborate: opts.corroborate,
     noReceipt: globals.noReceipt,
     noCache: globals.noCache
   });
@@ -7190,12 +7401,13 @@ program2.command("crawl <url>").description("crawl a site via Firecrawl (gated)"
   });
   emit(getGlobals(), result);
 });
-program2.command("search <query>").description("general web search via Tavily").option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--country <code>").action(async (query, opts) => {
+program2.command("search <query>").description("general web search via Tavily").option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--country <code>").option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).action(async (query, opts) => {
   const globals = getGlobals();
   const result = await run5(query, {
     maxResults: opts.maxResults,
     timeRange: opts.time,
     country: opts.country,
+    corroborate: opts.corroborate,
     noReceipt: globals.noReceipt,
     noCache: globals.noCache
   });

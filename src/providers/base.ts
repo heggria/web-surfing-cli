@@ -17,6 +17,7 @@ export interface NormalizedResultInit {
   sourceKind?: "doc" | "web" | "paper" | "code" | "company";
   provider: string;
   raw?: unknown;
+  corroboratedBy?: string[];
 }
 
 export class NormalizedResult {
@@ -28,6 +29,7 @@ export class NormalizedResult {
   sourceKind: "doc" | "web" | "paper" | "code" | "company";
   provider: string;
   urlNormalized: string;
+  corroboratedBy: string[];
   raw?: unknown;
 
   constructor(init: NormalizedResultInit) {
@@ -39,6 +41,7 @@ export class NormalizedResult {
     this.sourceKind = init.sourceKind ?? "web";
     this.provider = init.provider;
     this.raw = init.raw;
+    this.corroboratedBy = init.corroboratedBy ?? [];
     try {
       this.urlNormalized = init.url ? normalizeUrl(init.url) : "";
     } catch {
@@ -57,6 +60,7 @@ export class NormalizedResult {
       provider: this.provider,
       url_normalized: redactUrl(this.urlNormalized),
     };
+    if (this.corroboratedBy.length > 0) d.corroborated_by = this.corroboratedBy;
     if (includeRaw) d.raw = this.raw;
     return d;
   }

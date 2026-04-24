@@ -68,6 +68,42 @@ wsc receipts summary --days 7 --by-domain --cost
 wsc receipts tail --tool fetch --since 1h
 ```
 
+## Cross-validation & Confidence (v0.3)
+
+Default behavior of `search` / `discover` is "single primary provider; fall back on error." That answers fast and cheap, but the result has no cross-validation — if the primary returns a wrong or hallucinated URL, you cite it.
+
+For high-stakes claims, add `--corroborate N`:
+
+```bash
+wsc search "claude opus 4.7 release date" --time week --corroborate 3
+wsc discover "managed agent runtimes 2026" --corroborate 3
+```
+
+This fans out to up to N providers in parallel, dedupes by normalized URL, and produces:
+- `multi_source_evidence: [{provider, score}, ...]` in the receipt — only providers that returned ≥1 result are listed.
+- Each `result.corroborated_by: [...]` lists additional providers that returned the same URL. URLs with non-empty `corroborated_by` are the strongest signals — surface them first.
+
+**Confidence ladder (read the receipt to decide writeup tone):**
+
+| Receipt signal | Meaning | Writeup style |
+|---|---|---|
+| `multi_source_evidence: []` | Single provider, no cross-validation | "according to <provider>, ..." |
+| `multi_source_evidence` length ≥ 2 | Multiple providers participated and returned results | Plain factual statement OK |
+| Any result with `corroborated_by: ["X", "Y"]` | This specific URL was returned by 3+ providers | Strongest evidence — quote first |
+| `cache_hit: true` | Reusing a recent identical query | Same confidence as when first written |
+| `status: "degraded"` (with corroborate) | Fan-out collapsed to one survivor | Treat as single-provider |
+
+**When to spend the corroborate cost (N× billing):**
+- Version numbers, prices, release dates, benchmark numbers
+- Security advisories or vulnerability claims
+- Anything that would be embarrassing to be wrong about
+
+**When NOT to:**
+- Scoping / browsing queries
+- Single-domain lookups (use `--source` instead — coming in M3)
+
+`wsc receipts summary --high-confidence` filters to events with ≥2 providers in `multi_source_evidence` so you can audit how often you're actually cross-validating.
+
 ## Cache (v0.3)
 
 `wsc` keeps a content-addressed cache at `~/.cache/wsc/blobs/` for every successful `search`, `discover`, `fetch`, and `docs` response. Repeating the same query within the TTL window is **free** (no provider HTTP, `cache_hit: true` recorded in the receipt).
