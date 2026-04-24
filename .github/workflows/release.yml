@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install deps
+        run: bun install
+
+      - name: Verify version match
+        run: bash scripts/check-versions.sh
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-binaries:
+    runs-on: ubuntu-latest
+    needs: publish-npm
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: wsc-darwin-arm64
+            script: build:bin:darwin-arm64
+          - name: wsc-darwin-x64
+            script: build:bin:darwin-x64
+          - name: wsc-linux-x64
+            script: build:bin:linux-x64
+          - name: wsc-linux-arm64
+            script: build:bin:linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        run: bun install
+
+      - name: Build ${{ matrix.target.name }}
+        run: bun run ${{ matrix.target.script }}
+
+      - name: Compress binary
+        run: |
+          cd dist
+          tar -czf ${{ matrix.target.name }}.tar.gz ${{ matrix.target.name }}
+          shasum -a 256 ${{ matrix.target.name }}.tar.gz > ${{ matrix.target.name }}.tar.gz.sha256
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.target.name }}.tar.gz
+            dist/${{ matrix.target.name }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

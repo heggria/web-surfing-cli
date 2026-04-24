@@ -1,7 +1,7 @@
 {
   "name": "web-surfing-cli",
-  "description": "Routing-policy-driven web research for Claude Code (docs/discover/fetch/crawl/search) backed by the wsc CLI. Requires `wsc` installed separately via pipx — run /web-install if it's missing.",
-  "version": "0.1.0",
+  "description": "Routing-policy-driven web research for Claude Code (docs/discover/fetch/crawl/search) backed by the wsc CLI. Requires `wsc` installed separately via `npm i -g web-surfing-cli` or `bunx web-surfing-cli` — run /web-install if it's missing.",
+  "version": "0.2.0",
   "author": {
     "name": "heggria"
   },

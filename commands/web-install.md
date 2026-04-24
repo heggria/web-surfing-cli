@@ -1,41 +1,68 @@
 ---
-allowed-tools: Bash(command:*), Bash(pipx:*), Bash(python3:*), Bash(which:*), Bash(echo:*)
-description: Install or upgrade the wsc CLI (web-surfing-cli) via pipx. Run this when /web, /web-docs, /web-fetch etc. report "wsc not installed".
+allowed-tools: Bash(command:*), Bash(npm:*), Bash(bun:*), Bash(bunx:*), Bash(node:*), Bash(which:*), Bash(echo:*), Bash(curl:*)
+description: Install or upgrade the wsc CLI (web-surfing-cli) via npm or bun. Run this when /web, /web-docs, /web-fetch etc. report "wsc not installed".
 ---
 
-The web-surfing-cli plugin contains slash commands and a routing skill, but **does not ship a Python binary**. The `wsc` CLI must be installed separately via `pipx`.
+The web-surfing-cli plugin contains slash commands and a routing skill, but **does not ship the CLI binary**. The `wsc` CLI is distributed via npm and as standalone binaries.
 
-**Step 1 — check if pipx is available:**
+Pick one install path for the user — they all give them a global `wsc` command.
 
-```bash
-command -v pipx >/dev/null 2>&1 || { echo "pipx is not installed."; echo ""; echo "Install pipx first:"; echo "  brew install pipx        # macOS"; echo "  python3 -m pip install --user pipx && python3 -m pipx ensurepath"; echo ""; echo "Then re-run /web-install."; exit 64; }
-```
-
-**Step 2 — install or upgrade `wsc`:**
+**Path 1 — npm (works everywhere Node ≥ 18 is installed):**
 
 ```bash
-pipx install --force git+https://github.com/heggria/web-surfing-cli.git#subdirectory=cli
-```
-
-The `--force` flag makes the command idempotent — safe to re-run for upgrades.
-
-**Step 3 — verify it works and initialize config:**
-
-```bash
+npm i -g github:heggria/web-surfing-cli
 wsc --version
-wsc init                # creates ~/.config/wsc/{keys.toml,budget.toml} and state dirs
+```
+
+If `npm publish` has happened (check https://www.npmjs.com/package/web-surfing-cli):
+
+```bash
+npm i -g web-surfing-cli
+```
+
+**Path 2 — bun (faster install if they have Bun):**
+
+```bash
+bun add -g github:heggria/web-surfing-cli
+wsc --version
+```
+
+Or run without installing:
+
+```bash
+bunx web-surfing-cli@latest --version
+```
+
+**Path 3 — single binary (Node-free, ~63 MB):**
+
+Pick the right asset from https://github.com/heggria/web-surfing-cli/releases and curl it:
+
+```bash
+# macOS Apple Silicon
+curl -fsSL https://github.com/heggria/web-surfing-cli/releases/latest/download/wsc-darwin-arm64.tar.gz \
+  | tar -xz -C ~/.local/bin
+chmod +x ~/.local/bin/wsc-darwin-arm64
+mv ~/.local/bin/wsc-darwin-arm64 ~/.local/bin/wsc
+wsc --version
+```
+
+(Substitute `darwin-x64`, `linux-x64`, or `linux-arm64` as needed.)
+
+**Then initialize and configure:**
+
+```bash
+wsc init                # writes ~/.config/wsc/{keys.toml,budget.toml} and state dirs
 wsc config doctor       # shows which providers are ready / no_key / disabled
 ```
 
-**Step 4 — tell the user what to do next:**
+**Tell the user what to do next:**
 
-After install, the user typically wants to set provider keys. Tell them:
+After install, they typically want to set provider keys. Either edit `~/.config/wsc/keys.toml`, **or** set env vars (these take precedence):
 
-- Edit `~/.config/wsc/keys.toml`, **or** set env vars (these take precedence):
-  - `EXA_API_KEY` — get one at https://dashboard.exa.ai/api-keys
-  - `TAVILY_API_KEY` — get one at https://app.tavily.com/
-  - `FIRECRAWL_API_KEY` — get one at https://www.firecrawl.dev/app/api-keys
-  - `BRAVE_API_KEY` — get one at https://api.search.brave.com/app/keys
-  - `CONTEXT7_API_KEY` — optional, free tier works without a key
-- Re-run `wsc config doctor` to confirm.
-- Then re-try whatever slash command brought them here.
+- `EXA_API_KEY` — get one at https://dashboard.exa.ai/api-keys
+- `TAVILY_API_KEY` — get one at https://app.tavily.com/
+- `FIRECRAWL_API_KEY` — get one at https://www.firecrawl.dev/app/api-keys
+- `BRAVE_API_KEY` — get one at https://api.search.brave.com/app/keys
+- `CONTEXT7_API_KEY` — optional, free tier works without a key
+
+Re-run `wsc config doctor` to confirm. Then re-try whichever slash command brought them here.

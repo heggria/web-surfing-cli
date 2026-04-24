@@ -1,24 +1,16 @@
 # macOS
 .DS_Store
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.eggs/
-build/
+# Node / Bun
+node_modules/
 dist/
-.venv/
-venv/
-.tox/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
-*.pyc
+!dist/cli.mjs
+*.tgz
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
 
 # Editor
 .vscode/
@@ -28,6 +20,7 @@ htmlcov/
 # Local state / secrets — defense in depth (these live under ~/.config and ~/.local
 # normally, but if someone cp them into the repo we don't want to commit them)
 keys.toml
+keys.ini
 *.key
 .env
 .env.*

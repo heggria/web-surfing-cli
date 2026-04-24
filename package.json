@@ -1,0 +1,58 @@
+{
+  "name": "web-surfing-cli",
+  "version": "0.2.0",
+  "description": "Routing-policy-driven web research CLI across Context7, Exa, Tavily, Firecrawl, Brave, and DuckDuckGo with audit receipts. Companion Claude Code plugin marketplace included.",
+  "type": "module",
+  "license": "MIT",
+  "author": "heggria",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agent",
+    "search",
+    "mcp",
+    "exa",
+    "tavily",
+    "firecrawl",
+    "context7",
+    "research"
+  ],
+  "homepage": "https://github.com/heggria/web-surfing-cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heggria/web-surfing-cli.git"
+  },
+  "bugs": "https://github.com/heggria/web-surfing-cli/issues",
+  "bin": {
+    "wsc": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target=node --format=esm --outfile=dist/cli.mjs --banner=\"#!/usr/bin/env node\" && chmod +x dist/cli.mjs",
+    "build:bin:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 src/cli.ts --outfile=dist/wsc-darwin-arm64",
+    "build:bin:darwin-x64": "bun build --compile --target=bun-darwin-x64 src/cli.ts --outfile=dist/wsc-darwin-x64",
+    "build:bin:linux-x64": "bun build --compile --target=bun-linux-x64 src/cli.ts --outfile=dist/wsc-linux-x64",
+    "build:bin:linux-arm64": "bun build --compile --target=bun-linux-arm64 src/cli.ts --outfile=dist/wsc-linux-arm64",
+    "build:bin": "bun run build:bin:darwin-arm64 && bun run build:bin:darwin-x64 && bun run build:bin:linux-x64 && bun run build:bin:linux-arm64",
+    "test": "bun test",
+    "lint": "tsc --noEmit",
+    "dev": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "proper-lockfile": "^4.1.2",
+    "smol-toml": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.6.3"
+  }
+}

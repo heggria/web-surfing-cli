@@ -11,13 +11,13 @@ The CLI is `wsc`. It is a thin wrapper around five providers wired into a single
 
 ## First Rule
 
-If `wsc` is not on PATH, **stop and run `/web-install`** instead of calling raw HTTP. The CLI installs once via pipx; the plugin alone cannot ship a Python binary.
+If `wsc` is not on PATH, **stop and run `/web-install`** instead of calling raw HTTP. The CLI installs once via `npm i -g github:heggria/web-surfing-cli` (or `bun add -g`); the plugin alone cannot ship the binary.
 
 ```bash
 command -v wsc || echo "missing — run /web-install"
 ```
 
-If installed, you can also invoke it by absolute path: `~/.local/bin/wsc`.
+If installed via npm, you can also invoke it by absolute path: `~/.npm-global/bin/wsc` or wherever your `npm prefix -g` points.
 
 ## Routing Policy (locked-in — do not improvise)
 
