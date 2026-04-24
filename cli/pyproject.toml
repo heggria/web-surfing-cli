@@ -1,0 +1,42 @@
+[project]
+name = "web-surfing-cli"
+version = "0.1.0"
+description = "Unified evidence-acquisition CLI across Context7, Exa, Tavily, Firecrawl, Brave, and DuckDuckGo with routing, budgets, and audit receipts."
+requires-python = ">=3.9"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "heggria" }]
+keywords = ["search", "agent", "claude", "mcp", "exa", "tavily", "firecrawl", "context7"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = []
+
+[project.scripts]
+wsc = "wsc.cli:entrypoint"
+
+[project.urls]
+Homepage = "https://github.com/heggria/web-surfing-cli"
+Repository = "https://github.com/heggria/web-surfing-cli"
+Issues = "https://github.com/heggria/web-surfing-cli/issues"
+Documentation = "https://github.com/heggria/web-surfing-cli/blob/main/cli/README.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
