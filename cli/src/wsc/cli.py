@@ -11,12 +11,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import sys
 from typing import Any, Dict, List, Optional
 
 from wsc import __version__
 from wsc import audit, config, routing
+from wsc.ops import crawl as op_crawl
+from wsc.ops import discover as op_discover
+from wsc.ops import docs as op_docs
+from wsc.ops import fetch as op_fetch
+from wsc.ops import plan as op_plan
+from wsc.ops import search as op_search
 
 
 # --- Global flag handling -------------------------------------------------
@@ -196,22 +201,51 @@ def _build_parser() -> argparse.ArgumentParser:
     sum_p.add_argument("--cost", action="store_true")
     sum_p.add_argument("--high-confidence", dest="high_confidence", action="store_true")
 
-    # plan (M1: --explain only; M2 wires real execution)
+    # plan (real exec; --explain skips providers)
     plan_p = sub.add_parser("plan", help="auto-route a query to the right tool")
     plan_p.add_argument("query")
-    plan_p.add_argument("--explain", action="store_true", help="show route decision without calling providers (M1)")
+    plan_p.add_argument("--explain", action="store_true", help="show route decision without calling providers")
     plan_p.add_argument("--prefer", choices=["fast", "deep"], default=None)
     plan_p.add_argument("--router", choices=["rule", "llm"], default="rule")
 
-    # M2 placeholders so help+autocomplete include them.
-    for name, help_text in (
-        ("docs", "fetch official library docs via Context7 (M2)"),
-        ("discover", "semantic discovery via Exa (M2)"),
-        ("fetch", "clean a known URL via Firecrawl (M2)"),
-        ("crawl", "crawl a site via Firecrawl (M2)"),
-        ("search", "general web search via Tavily (M2)"),
-    ):
-        sub.add_parser(name, help=help_text)
+    # docs (Context7 → Firecrawl readme fallback)
+    docs_p = sub.add_parser("docs", help="fetch official library docs via Context7")
+    docs_p.add_argument("library")
+    docs_p.add_argument("--topic", default=None)
+    docs_p.add_argument("--version", default=None)
+
+    # discover (Exa primary)
+    disc_p = sub.add_parser("discover", help="semantic discovery via Exa")
+    disc_p.add_argument("query")
+    disc_p.add_argument("--type", dest="type_", choices=["code", "paper", "company", "people"], default=None)
+    disc_p.add_argument("--since", dest="since_days", type=int, default=None, help="restrict to last N days")
+    disc_p.add_argument("--num-results", type=int, default=10)
+
+    # fetch (Firecrawl primary, urllib fallback)
+    fetch_p = sub.add_parser("fetch", help="clean a known URL via Firecrawl")
+    fetch_p.add_argument("url")
+    fetch_p.add_argument("--format", dest="formats", action="append", default=None,
+                         help="markdown|html (repeatable; default: markdown)")
+    fetch_p.add_argument("--screenshot", action="store_true")
+
+    # crawl (Firecrawl only, gated)
+    crawl_p = sub.add_parser("crawl", help="crawl a site via Firecrawl (gated)")
+    crawl_p.add_argument("url")
+    crawl_p.add_argument("--max-pages", dest="max_pages", type=int, default=10)
+    crawl_p.add_argument("--include-paths", dest="include_paths", action="append", default=None)
+    crawl_p.add_argument("--exclude-paths", dest="exclude_paths", action="append", default=None)
+    crawl_p.add_argument("--format", dest="formats", action="append", default=None)
+    crawl_p.add_argument("--apply", action="store_true",
+                         help="required for crawls of 11–100 pages")
+    crawl_p.add_argument("--i-know-this-burns-credits", dest="deep_apply", action="store_true",
+                         help="required for crawls > 100 pages")
+
+    # search (Tavily primary, brave/ddg fallback)
+    search_p = sub.add_parser("search", help="general web search via Tavily")
+    search_p.add_argument("query")
+    search_p.add_argument("--max-results", dest="max_results", type=int, default=10)
+    search_p.add_argument("--time", dest="time_range", choices=["day", "week", "month", "year"], default=None)
+    search_p.add_argument("--country", default=None)
 
     return p
 
@@ -236,17 +270,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _emit(args, _dispatch_receipts(args))
         if args.command == "plan":
             return _emit(args, _dispatch_plan(args))
-        # M2 placeholders.
-        if args.command in {"docs", "discover", "fetch", "crawl", "search"}:
-            return _emit(
-                args,
-                {
-                    "ok": False,
-                    "operation": args.command,
-                    "error": f"`wsc {args.command}` requires M2 providers (planned next milestone)",
-                    "returncode": 64,
-                },
-            )
+        if args.command == "docs":
+            return _emit(args, op_docs.run(
+                args.library, topic=args.topic, version=args.version,
+                no_receipt=args.no_receipt,
+            ))
+        if args.command == "discover":
+            return _emit(args, op_discover.run(
+                args.query, type_=args.type_, since_days=args.since_days,
+                num_results=args.num_results, no_receipt=args.no_receipt,
+            ))
+        if args.command == "fetch":
+            return _emit(args, op_fetch.run(
+                args.url, formats=args.formats, screenshot=args.screenshot,
+                no_receipt=args.no_receipt,
+            ))
+        if args.command == "crawl":
+            return _emit(args, op_crawl.run(
+                args.url, max_pages=args.max_pages,
+                include_paths=args.include_paths, exclude_paths=args.exclude_paths,
+                formats=args.formats, apply=args.apply, deep_apply=args.deep_apply,
+                no_receipt=args.no_receipt,
+            ))
+        if args.command == "search":
+            return _emit(args, op_search.run(
+                args.query, max_results=args.max_results,
+                time_range=args.time_range, country=args.country,
+                no_receipt=args.no_receipt,
+            ))
     except Exception as exc:  # noqa: BLE001
         return _emit(
             args,
@@ -314,27 +365,20 @@ def _dispatch_receipts(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _dispatch_plan(args: argparse.Namespace) -> Dict[str, Any]:
-    router = routing.get_router(args.router)
-    decision = router.classify(
-        args.query,
-        context={"prefer": args.prefer, "budget_override": args.budget},
-    )
     if args.explain:
-        return {
-            "ok": True,
-            "operation": "plan.explain",
-            "query": args.query,
-            "decision": decision.to_dict(),
-            "would_run": f"wsc {decision.recommended_op} {shlex.quote(args.query)}",
-            "returncode": 0,
-        }
-    return {
-        "ok": False,
-        "operation": "plan",
-        "error": "plan execution requires M2 providers; use --explain in M1",
-        "decision": decision.to_dict(),
-        "returncode": 64,
-    }
+        return op_plan.explain(
+            args.query,
+            prefer=args.prefer,
+            budget_override=args.budget,
+            router_name=args.router,
+        )
+    return op_plan.run(
+        args.query,
+        prefer=args.prefer,
+        budget_override=args.budget,
+        router_name=args.router,
+        no_receipt=args.no_receipt,
+    )
 
 
 def entrypoint() -> None:

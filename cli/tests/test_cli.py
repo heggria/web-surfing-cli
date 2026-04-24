@@ -91,22 +91,65 @@ def test_plan_explain_for_url(capsys):
     assert payload["decision"]["recommended_op"] == "fetch"
 
 
-def test_plan_without_explain_returns_64_in_m1(capsys):
+def test_plan_without_explain_attempts_dispatch(capsys, monkeypatch):
+    """In M2, `wsc plan <q>` actually executes. Without keys + with all
+    providers' HTTP monkey-patched to raise TransportError, we expect a
+    structured failure that includes a fallback_chain and the route decision.
+    """
+    from wsc.providers import base as provider_base
+
+    def boom(*args, **kwargs):
+        raise provider_base.TransportError("network down (test)")
+
+    monkeypatch.setattr(provider_base, "http_request", boom)
+    # Patch the symbol that providers import directly, too.
+    from wsc.providers import context7, exa, firecrawl, tavily
+
+    for mod in (context7, exa, firecrawl, tavily):
+        monkeypatch.setattr(mod, "http_request", boom)
+
     rc = main(["--json", "plan", "react useState"])
-    assert rc == 64
+    assert rc != 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["operation"] == "plan"
-    assert "M2" in payload["error"]
-    # Decision is still present so callers see the route.
+    assert payload["dispatched_op"] == "docs"
     assert payload["decision"]["recommended_op"] == "docs"
+    # docs sub-result should show its fallback chain.
+    sub = payload["result"]
+    assert sub["ok"] is False
+    assert sub["fallback_chain"], "fallback_chain should record context7 failure"
 
 
-def test_m2_subcommands_return_64(capsys):
-    for sub in ("docs", "discover", "fetch", "crawl", "search"):
-        rc = main(["--json", sub])
-        assert rc == 64
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["operation"] == sub
+def test_docs_subcommand_dispatches(capsys, monkeypatch):
+    """`wsc docs <library>` parses correctly and routes through ops.docs."""
+    from wsc.ops import docs as op_docs_mod
+
+    captured: dict = {}
+
+    def fake_run(library, **kwargs):
+        captured["library"] = library
+        captured["kwargs"] = kwargs
+        return {"ok": True, "operation": "docs", "library": library, "returncode": 0}
+
+    monkeypatch.setattr(op_docs_mod, "run", fake_run)
+    rc = main(["--json", "docs", "react", "--topic", "hooks"])
+    assert rc == 0
+    assert captured["library"] == "react"
+    assert captured["kwargs"]["topic"] == "hooks"
+
+
+def test_crawl_apply_gate_blocks_without_apply(capsys):
+    rc = main(["--json", "crawl", "https://example.com", "--max-pages", "50"])
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert "--apply" in payload["error"]
+
+
+def test_crawl_apply_gate_blocks_huge_without_deep_apply(capsys):
+    rc = main(["--json", "crawl", "https://example.com", "--max-pages", "500", "--apply"])
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert "--i-know-this-burns-credits" in payload["error"]
 
 
 def test_plan_explain_writes_no_receipt(capsys):
