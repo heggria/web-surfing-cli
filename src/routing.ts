@@ -48,6 +48,10 @@ const DISCOVERY_PATTERNS: RegExp[] = [
   /\b(competitors?|comparison|landscape|survey)\b/i,
   /\b(libraries?|tools?|projects?)\s+like\b/i,
   /\b(compare|comparing|differences?\s+between)\b/i,
+  // M4 v0.3: route community / opinion / discussion intents to discover so
+  // the user gets the semantic neighbors instead of a generic web search.
+  /\b(discussions?|opinions?|reactions?|takes?|community|voices?|sentiment|hot\s+takes?|critiques?)\b/i,
+  /\bwhat\s+(do|are)\s+people\s+(saying|think)\b/i,
 ];
 
 const TIME_PATTERNS: RegExp[] = [

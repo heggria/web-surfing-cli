@@ -4751,6 +4751,14 @@ var PROVIDERS = {
     envKeys: ["TAVILY_API_KEY"],
     homepage: "https://app.tavily.com/"
   },
+  "tavily-extract": {
+    needsKey: true,
+    role: "url_fetch",
+    fallbackRoles: [],
+    envKeys: ["TAVILY_API_KEY"],
+    fileSection: "tavily",
+    homepage: "https://app.tavily.com/"
+  },
   firecrawl: {
     needsKey: true,
     role: "url_fetch",
@@ -4778,7 +4786,7 @@ var ROLE_FALLBACK_CHAIN = {
   semantic_discovery: ["exa", "tavily", "brave", "duckduckgo"],
   web_facts: ["tavily", "brave", "duckduckgo"],
   web_facts_zero_key: ["duckduckgo"],
-  url_fetch: ["firecrawl"],
+  url_fetch: ["firecrawl", "tavily-extract"],
   url_crawl: ["firecrawl"]
 };
 function configDir() {
@@ -4871,7 +4879,8 @@ function loadKeys() {
       apiKeys[provider] = envValue;
       continue;
     }
-    const section = file[provider];
+    const sectionKey = meta.fileSection ?? provider;
+    const section = file[sectionKey];
     if (section && typeof section === "object") {
       const k = section["api_key"];
       if (typeof k === "string" && k.trim()) {
@@ -5294,6 +5303,9 @@ function humanSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// src/ops/deepdive.ts
+import { createHash as createHash4, randomUUID as randomUUID3 } from "node:crypto";
+
 // src/providers/base.ts
 class NormalizedResult {
   url;
@@ -5539,7 +5551,12 @@ class BraveProvider extends Provider {
     return this.apiKey;
   }
   async search(query, opts = {}) {
-    const params = { q: query, count: String(opts.count ?? 10) };
+    let q = query;
+    if (opts.includeDomains && opts.includeDomains.length > 0) {
+      const sites = opts.includeDomains.map((d) => `site:${d}`).join(" OR ");
+      q = `(${sites}) ${query}`;
+    }
+    const params = { q, count: String(opts.count ?? 10) };
     if (opts.country)
       params.country = opts.country;
     if (opts.freshness)
@@ -5946,6 +5963,7 @@ function sleep(ms) {
 
 // src/providers/tavily.ts
 var ENDPOINT4 = "https://api.tavily.com/search";
+var EXTRACT_ENDPOINT = "https://api.tavily.com/extract";
 
 class TavilyProvider extends Provider {
   name = "tavily";
@@ -6001,6 +6019,59 @@ class TavilyProvider extends Provider {
     return out;
   }
 }
+
+class TavilyExtractProvider extends Provider {
+  name = "tavily-extract";
+  schemaVersion = "tavily-extract-v1-2026-04";
+  apiKey;
+  constructor(apiKey) {
+    super();
+    this.apiKey = apiKey;
+  }
+  ensureKey() {
+    if (!this.apiKey)
+      throw new MissingKeyError(this.name);
+    return this.apiKey;
+  }
+  async extract(url, opts = {}) {
+    const body = {
+      api_key: this.ensureKey(),
+      urls: [url],
+      extract_depth: opts.extractDepth ?? "basic",
+      include_images: opts.includeImages ?? false
+    };
+    const response = await httpRequest(EXTRACT_ENDPOINT, {
+      method: "POST",
+      body,
+      timeoutMs: opts.timeoutMs ?? 45000
+    });
+    const payload = response.json ?? {};
+    const results = safeGet(payload, ["results"], []) ?? [];
+    const failed = safeGet(payload, ["failed_results"], []) ?? [];
+    if (results.length === 0) {
+      const reason = failed.length > 0 ? String(safeGet(failed[0], ["error"], "no content")) : "no content";
+      throw new ProviderError(`tavily-extract: ${reason} for ${url}`);
+    }
+    const r = results[0];
+    const raw = String(safeGet(r, ["raw_content"], "") ?? "");
+    const sourceUrl = String(safeGet(r, ["url"], url) ?? url);
+    if (!raw)
+      throw new ProviderError(`tavily-extract: empty raw_content for ${url}`);
+    return new FetchedPage({
+      url: sourceUrl,
+      title: deriveTitle(raw, sourceUrl),
+      markdown: raw.slice(0, 200000),
+      provider: this.name,
+      status: "degraded",
+      metadata: { sourceURL: sourceUrl, extractDepth: opts.extractDepth ?? "basic" }
+    });
+  }
+}
+function deriveTitle(content, fallback) {
+  const lines = content.split(`
+`).map((l) => l.trim()).filter(Boolean);
+  return lines[0]?.slice(0, 200) || fallback;
+}
 function toFloat2(v) {
   if (v == null)
     return null;
@@ -6013,6 +6084,7 @@ var FACTORY = {
   context7: Context7Provider,
   exa: ExaProvider,
   tavily: TavilyProvider,
+  "tavily-extract": TavilyExtractProvider,
   firecrawl: FirecrawlProvider,
   brave: BraveProvider,
   duckduckgo: DuckDuckGoProvider
@@ -6093,7 +6165,7 @@ async function runChainParallel(chain, actions, opts) {
     }
   }
   if (candidates.length === 0) {
-    return { result: [], active: null, participants: [], failures };
+    return { result: [], active: null, participants: [], failures, rejected: [] };
   }
   const settled = await Promise.allSettled(candidates.map(async ({ name, provider }) => ({
     provider: name,
@@ -6123,14 +6195,17 @@ async function runChainParallel(chain, actions, opts) {
     }
   }
   if (perProvider.length === 0) {
-    return { result: [], active: null, participants: [], failures };
+    return { result: [], active: null, participants: [], failures, rejected: [] };
   }
   const seen = new Map;
+  const rejected = [];
   for (const { provider, results } of perProvider) {
     for (const r of results) {
       const key = r.urlNormalized || r.url;
-      if (!key)
+      if (!key) {
+        rejected.push({ url: r.url || "(empty)", reason: "empty_url" });
         continue;
+      }
       const existing = seen.get(key);
       if (!existing) {
         const cloned = new NormalizedResult({
@@ -6147,6 +6222,7 @@ async function runChainParallel(chain, actions, opts) {
         seen.set(key, cloned);
       } else if (provider !== existing.provider && !existing.corroboratedBy.includes(provider)) {
         existing.corroboratedBy.push(provider);
+        rejected.push({ url: r.url, reason: `merged_into_${existing.provider}` });
       }
     }
   }
@@ -6172,7 +6248,8 @@ async function runChainParallel(chain, actions, opts) {
     result: merged,
     active: perProvider[0].provider,
     participants,
-    failures
+    failures,
+    rejected
   };
 }
 async function chainFailedPayload(opName, fallback) {
@@ -6186,6 +6263,590 @@ async function chainFailedPayload(opName, fallback) {
   };
 }
 
+// src/ops/search.ts
+var TIME_TO_TAVILY_DAYS = { day: 1, week: 7, month: 30, year: 365 };
+var TIME_TO_BRAVE_FRESHNESS = { day: "pd", week: "pw", month: "pm", year: "py" };
+async function run(query, opts = {}) {
+  const chain = filteredChain("web_facts");
+  const max = opts.maxResults ?? 10;
+  const corroborate = opts.corroborate && opts.corroborate >= 2 ? opts.corroborate : 0;
+  const cKey = cacheKey({
+    op: corroborate ? `search:corroborate-${corroborate}` : "search",
+    query,
+    params: {
+      max_results: max,
+      time_range: opts.timeRange ?? null,
+      country: opts.country ?? null,
+      include_domains: opts.includeDomains ?? null
+    }
+  });
+  const tavilyAction = (provider) => provider.search(query, {
+    maxResults: max,
+    searchDepth: "basic",
+    topic: opts.timeRange ? "news" : undefined,
+    days: opts.timeRange ? TIME_TO_TAVILY_DAYS[opts.timeRange] : undefined,
+    country: opts.country,
+    includeDomains: opts.includeDomains
+  });
+  const braveAction = (provider) => provider.search(query, {
+    count: max,
+    country: opts.country,
+    freshness: opts.timeRange ? TIME_TO_BRAVE_FRESHNESS[opts.timeRange] : undefined,
+    includeDomains: opts.includeDomains
+  });
+  const ddgAction = (provider) => provider.search(query, { count: max });
+  return await withCall("search", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
+    Object.assign(receipt, queryFingerprint(query));
+    receipt.params = {
+      max_results: max,
+      time_range: opts.timeRange ?? null,
+      country: opts.country ?? null,
+      include_domains: opts.includeDomains ?? null,
+      corroborate: corroborate || null
+    };
+    const cached = await get(cKey, CACHE_TTL_SEC.search, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
+      receipt.results_count = cached.results.length;
+      receipt.selected_count = cached.results.length;
+      if (cached.multi_source_evidence)
+        receipt.multi_source_evidence = cached.multi_source_evidence;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "search",
+        provider: cached.provider,
+        query,
+        results: cached.results,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        multi_source_evidence: cached.multi_source_evidence,
+        returncode: 0
+      };
+    }
+    if (corroborate) {
+      const { result: result2, active: active2, participants, failures, rejected } = await runChainParallel(chain, { tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
+      receipt.fallback_chain = failures;
+      receipt.cache_hit = false;
+      if (rejected.length > 0)
+        receipt.rejected = rejected;
+      if (active2 === null) {
+        receipt.status = "error";
+        return await chainFailedPayload("search", failures);
+      }
+      receipt.provider = active2;
+      receipt.selected_urls = result2.map((r) => r.url);
+      receipt.results_count = result2.length;
+      receipt.selected_count = result2.length;
+      const productive = participants.filter((p) => p.result_count > 0);
+      const multiEvidence = productive.map((p) => ({
+        provider: p.provider,
+        ...p.best_score != null ? { score: p.best_score } : {}
+      }));
+      receipt.multi_source_evidence = multiEvidence;
+      const status2 = productive.length >= 2 ? "ok" : "degraded";
+      if (status2 === "degraded")
+        receipt.status = "degraded";
+      const resultsJson2 = result2.map((r) => r.toJSON());
+      await set(cKey, {
+        provider: active2,
+        results: resultsJson2,
+        fallback_chain: failures,
+        cached_status: status2,
+        multi_source_evidence: multiEvidence
+      }, { ttlSec: CACHE_TTL_SEC.search, op: "search:corroborate", provider: active2, noCache: opts.noCache });
+      return {
+        ok: true,
+        operation: "search",
+        provider: active2,
+        query,
+        results: resultsJson2,
+        fallback_chain: failures,
+        status: status2,
+        cache_hit: false,
+        multi_source_evidence: multiEvidence,
+        participants,
+        returncode: 0
+      };
+    }
+    const { active, result, fallback } = await runChain(chain, {
+      tavily: tavilyAction,
+      brave: braveAction,
+      duckduckgo: ddgAction
+    });
+    receipt.fallback_chain = fallback;
+    receipt.cache_hit = false;
+    if (active === null || result === null) {
+      receipt.status = "error";
+      return await chainFailedPayload("search", fallback);
+    }
+    receipt.provider = active;
+    const urls = result.map((r) => r.url);
+    receipt.selected_urls = urls;
+    receipt.results_count = result.length;
+    receipt.selected_count = result.length;
+    const status = active !== chain[0] ? "degraded" : "ok";
+    if (status === "degraded")
+      receipt.status = "degraded";
+    const resultsJson = result.map((r) => r.toJSON());
+    await set(cKey, { provider: active, results: resultsJson, fallback_chain: fallback, cached_status: status }, { ttlSec: CACHE_TTL_SEC.search, op: "search", provider: active, noCache: opts.noCache });
+    return {
+      ok: true,
+      operation: "search",
+      provider: active,
+      query,
+      results: resultsJson,
+      fallback_chain: fallback,
+      status,
+      cache_hit: false,
+      returncode: 0
+    };
+  });
+}
+
+// src/ops/fetch.ts
+import { createHash as createHash3, randomUUID as randomUUID2 } from "node:crypto";
+var TAG_RE2 = /<[^>]+>/g;
+var WS_RE = /\n{3,}/g;
+var ENTITY_MAP2 = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " " };
+function decodeEntities2(s) {
+  return s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (m) => ENTITY_MAP2[m] ?? m).replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(Number.parseInt(n, 16)));
+}
+async function stdlibFetch(url) {
+  const resp = await httpRequest(url, { method: "GET", timeoutMs: 30000 });
+  const text = resp.text;
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? decodeEntities2(titleMatch[1].trim()) : url;
+  const body = decodeEntities2(text.replace(TAG_RE2, `
+`)).trim().replace(WS_RE, `
+
+`);
+  return new FetchedPage({
+    url,
+    title,
+    markdown: body.slice(0, 50000),
+    provider: "urllib",
+    status: "degraded"
+  });
+}
+async function run2(url, opts = {}) {
+  const chain = filteredChain("url_fetch");
+  const cKey = cacheKey({
+    op: "fetch",
+    query: url,
+    params: { formats: opts.formats ?? null, screenshot: !!opts.screenshot }
+  });
+  const firecrawlAction = (provider) => provider.scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
+  const tavilyExtractAction = (provider) => provider.extract(url);
+  return await withCall("fetch", {
+    provider: "firecrawl",
+    correlationId: opts.correlationId,
+    noReceipt: opts.noReceipt,
+    parentCallId: opts.parentCallId ?? null
+  }, async (receipt) => {
+    Object.assign(receipt, queryFingerprint(url));
+    receipt.params = { formats: opts.formats ?? null, screenshot: !!opts.screenshot };
+    const cached = await get(cKey, CACHE_TTL_SEC.fetch, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      const cachedUrl = cached.page.url;
+      receipt.selected_urls = typeof cachedUrl === "string" ? [cachedUrl] : [];
+      receipt.selected_count = receipt.selected_urls.length;
+      receipt.results_count = receipt.selected_urls.length;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "fetch",
+        provider: cached.provider,
+        page: cached.page,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        returncode: 0
+      };
+    }
+    const { active, result, fallback } = await runChain(chain, {
+      firecrawl: firecrawlAction,
+      "tavily-extract": tavilyExtractAction
+    });
+    receipt.fallback_chain = [...fallback];
+    receipt.cache_hit = false;
+    if (active === null || result === null) {
+      try {
+        const page = await stdlibFetch(url);
+        receipt.fallback_chain.push({
+          from: "firecrawl",
+          to: "urllib",
+          reason: "all_providers_failed"
+        });
+        receipt.provider = "urllib";
+        receipt.status = "degraded";
+        receipt.selected_urls = [page.url];
+        receipt.selected_count = 1;
+        receipt.results_count = 1;
+        const pageJson2 = page.toJSON();
+        await set(cKey, { provider: "urllib", page: pageJson2, fallback_chain: receipt.fallback_chain, cached_status: "degraded" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: "urllib", noCache: opts.noCache });
+        return {
+          ok: true,
+          operation: "fetch",
+          provider: "urllib",
+          page: pageJson2,
+          fallback_chain: receipt.fallback_chain,
+          status: "degraded",
+          cache_hit: false,
+          returncode: 0
+        };
+      } catch (err) {
+        receipt.status = "error";
+        receipt.error = (err instanceof Error ? err.message : String(err)).slice(0, 200);
+        receipt.fallback_chain.push({
+          from: "urllib",
+          reason: "transport_error",
+          error: (err instanceof Error ? err.message : String(err)).slice(0, 200)
+        });
+        return {
+          ok: false,
+          operation: "fetch",
+          provider: null,
+          fallback_chain: receipt.fallback_chain,
+          error: `fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+          returncode: 2
+        };
+      }
+    }
+    receipt.provider = active;
+    receipt.selected_urls = result.url ? [result.url] : [];
+    receipt.selected_count = 1;
+    receipt.results_count = 1;
+    const pageJson = result.toJSON();
+    const status = result.status;
+    await set(cKey, { provider: active, page: pageJson, fallback_chain: fallback, cached_status: status === "degraded" ? "degraded" : "ok" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: active, noCache: opts.noCache });
+    return {
+      ok: true,
+      operation: "fetch",
+      provider: active,
+      page: pageJson,
+      fallback_chain: receipt.fallback_chain,
+      status: result.status,
+      cache_hit: false,
+      returncode: 0
+    };
+  });
+}
+async function runMany(urls, opts = {}) {
+  const opName = opts.op ?? "batch_fetch";
+  if (urls.length === 0) {
+    return {
+      ok: false,
+      operation: opName,
+      error: "no URLs provided",
+      returncode: 2
+    };
+  }
+  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 4, 16));
+  const parentCallId = opts.parentCallId ?? randomUUID2();
+  const started = Date.now();
+  const entries = new Array(urls.length);
+  let okCount = 0;
+  let degradedCount = 0;
+  let errorCount = 0;
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= urls.length)
+        return;
+      const url = urls[i];
+      const childStart = Date.now();
+      try {
+        const childResult = await run2(url, {
+          formats: opts.formats,
+          screenshot: opts.screenshot,
+          correlationId: opts.correlationId,
+          noReceipt: opts.noReceipt,
+          noCache: opts.noCache,
+          parentCallId
+        });
+        const ok = childResult.ok === true;
+        const page = childResult.page;
+        const md = page?.markdown ?? "";
+        const sha = md ? createHash3("sha256").update(md, "utf8").digest("hex") : null;
+        const status = childResult.status ?? (ok ? "ok" : "error");
+        if (status === "ok")
+          okCount += 1;
+        else if (status === "degraded")
+          degradedCount += 1;
+        else
+          errorCount += 1;
+        entries[i] = {
+          url,
+          sha256: sha,
+          status,
+          provider: childResult.provider ?? null,
+          duration_ms: Date.now() - childStart,
+          title: page?.title ?? undefined,
+          bytes: md ? md.length : undefined,
+          error: ok ? undefined : childResult.error ?? undefined
+        };
+      } catch (err) {
+        errorCount += 1;
+        entries[i] = {
+          url,
+          sha256: null,
+          status: "error",
+          provider: null,
+          duration_ms: Date.now() - childStart,
+          error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 200) : String(err).slice(0, 200)
+        };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
+  const overallStatus = errorCount === urls.length ? "error" : degradedCount + errorCount > 0 ? "degraded" : "ok";
+  const batchReceipt = {
+    ts: utcIso(),
+    call_id: parentCallId,
+    parent_call_id: null,
+    correlation_id: opts.correlationId ?? process.env.WSC_CORRELATION_ID ?? null,
+    op: opName,
+    provider: null,
+    selected_urls: urls,
+    results_count: urls.length,
+    selected_count: urls.length,
+    urls: entries.map((e) => ({
+      url: e.url,
+      sha256: e.sha256 ?? undefined,
+      status: e.status,
+      provider: e.provider ?? undefined,
+      duration_ms: e.duration_ms
+    })),
+    duration_ms: Date.now() - started,
+    started_at: utcIso(started),
+    status: overallStatus
+  };
+  if (!opts.noReceipt) {
+    try {
+      await record(batchReceipt);
+    } catch {}
+  }
+  return {
+    ok: errorCount < urls.length,
+    operation: opName,
+    parent_call_id: parentCallId,
+    urls: entries,
+    counts: { ok: okCount, degraded: degradedCount, error: errorCount, total: urls.length },
+    duration_ms: Date.now() - started,
+    status: overallStatus,
+    returncode: errorCount === urls.length ? 2 : 0
+  };
+}
+
+// src/ops/deepdive.ts
+var DEPTH_PRESETS = {
+  shallow: { topK: 3, corroborate: 0, excerpt_chars: 1000 },
+  standard: { topK: 5, corroborate: 2, excerpt_chars: 1500 },
+  deep: { topK: 5, corroborate: 3, excerpt_chars: 2500 }
+};
+async function run3(query, opts = {}) {
+  const depth = opts.depth ?? "standard";
+  const preset = DEPTH_PRESETS[depth];
+  const correlationId = opts.correlationId ?? randomUUID3();
+  return await withCall("deepdive", {
+    provider: null,
+    correlationId,
+    noReceipt: opts.noReceipt
+  }, async (receipt) => {
+    Object.assign(receipt, queryFingerprint(query));
+    receipt.params = {
+      depth,
+      topK: preset.topK,
+      corroborate: preset.corroborate,
+      include_domains: opts.includeDomains ?? null,
+      time_range: opts.timeRange ?? null
+    };
+    const searchPayload = await run(query, {
+      maxResults: preset.topK,
+      timeRange: opts.timeRange,
+      includeDomains: opts.includeDomains,
+      corroborate: preset.corroborate || undefined,
+      correlationId,
+      noCache: opts.noCache
+    });
+    if (!searchPayload.ok) {
+      receipt.status = "error";
+      return {
+        ok: false,
+        operation: "deepdive",
+        query,
+        depth,
+        error: `deepdive: search step failed: ${searchPayload.error ?? "unknown"}`,
+        search: searchPayload,
+        returncode: 2
+      };
+    }
+    const results = searchPayload.results ?? [];
+    if (results.length === 0) {
+      receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "deepdive",
+        query,
+        depth,
+        markdown: emptyMarkdown(query, depth),
+        evidence: [],
+        search: { provider: searchPayload.provider, status: searchPayload.status },
+        returncode: 0
+      };
+    }
+    const topResults = results.slice(0, preset.topK);
+    const topUrls = topResults.map((r) => String(r.url ?? ""));
+    const fetched = await Promise.all(topUrls.map(async (url) => {
+      try {
+        const f = await run2(url, { correlationId, noCache: opts.noCache });
+        return { url, payload: f };
+      } catch (err) {
+        return { url, payload: null, error: err instanceof Error ? err.message : String(err) };
+      }
+    }));
+    const fetchedAt = new Date().toISOString();
+    const evidence = [];
+    for (let i = 0;i < topResults.length; i++) {
+      const r = topResults[i];
+      const fetchEntry = fetched[i];
+      const payload = fetchEntry.payload;
+      if (!payload || !payload.ok) {
+        evidence.push({
+          url: String(r.url ?? ""),
+          sha256: null,
+          fetched_at: fetchedAt,
+          status: "error",
+          provider: null,
+          title: String(r.title ?? ""),
+          snippet: String(r.snippet ?? ""),
+          excerpt: "",
+          corroborated_by: r.corroborated_by ?? []
+        });
+        continue;
+      }
+      const page = payload.page ?? {};
+      const md = String(page.markdown ?? "");
+      const sha = md ? createHash4("sha256").update(md, "utf8").digest("hex") : null;
+      evidence.push({
+        url: String(page.url ?? r.url ?? ""),
+        sha256: sha,
+        fetched_at: fetchedAt,
+        status: String(payload.status ?? "ok"),
+        provider: String(payload.provider ?? "unknown"),
+        title: String(page.title ?? r.title ?? ""),
+        snippet: String(r.snippet ?? ""),
+        excerpt: md.slice(0, preset.excerpt_chars),
+        corroborated_by: r.corroborated_by ?? []
+      });
+    }
+    const okCount = evidence.filter((e) => e.status === "ok").length;
+    const degradedCount = evidence.filter((e) => e.status === "degraded").length;
+    const errorCount = evidence.filter((e) => e.status === "error").length;
+    const overallStatus = errorCount === evidence.length ? "error" : degradedCount + errorCount > 0 ? "degraded" : "ok";
+    const markdown = stitchMarkdown({
+      query,
+      depth,
+      evidence,
+      searchProvider: String(searchPayload.provider ?? "?"),
+      multiSourceEvidence: searchPayload.multi_source_evidence ?? [],
+      fetchedAt
+    });
+    receipt.results_count = evidence.length;
+    receipt.selected_count = okCount;
+    receipt.selected_urls = evidence.map((e) => e.url);
+    receipt.verified_urls = evidence.filter((e) => e.sha256).map((e) => ({
+      url: e.url,
+      sha256: e.sha256,
+      fetched_at: e.fetched_at,
+      status: e.status
+    }));
+    if (overallStatus !== "ok")
+      receipt.status = overallStatus;
+    return {
+      ok: errorCount < evidence.length,
+      operation: "deepdive",
+      query,
+      depth,
+      markdown,
+      evidence,
+      counts: { ok: okCount, degraded: degradedCount, error: errorCount, total: evidence.length },
+      search: {
+        provider: searchPayload.provider,
+        status: searchPayload.status,
+        multi_source_evidence: searchPayload.multi_source_evidence
+      },
+      status: overallStatus,
+      correlation_id: correlationId,
+      returncode: errorCount === evidence.length ? 2 : 0
+    };
+  });
+}
+function emptyMarkdown(query, depth) {
+  return `# Deepdive: ${escapeMd(query)}
+
+**Depth:** ${depth} | **Result:** no search hits
+
+Nothing returned. Try a broader query or remove --time/--source restrictions.
+`;
+}
+function stitchMarkdown(args) {
+  const out = [];
+  out.push(`# Deepdive: ${escapeMd(args.query)}`);
+  out.push("");
+  const validProviders = args.multiSourceEvidence.length;
+  const sourcesLine = validProviders >= 2 ? `corroborated across ${validProviders} providers (${args.multiSourceEvidence.map((e) => e.provider).join(", ")})` : `single-provider (${args.searchProvider})`;
+  out.push(`**Depth:** ${args.depth} | **Generated:** ${args.fetchedAt} | **Search:** ${sourcesLine}`);
+  out.push("");
+  out.push(`Below are ${args.evidence.length} sources, each with a sha256 proof from the fetched markdown body.`);
+  out.push("");
+  for (let i = 0;i < args.evidence.length; i++) {
+    const e = args.evidence[i];
+    out.push("---");
+    out.push("");
+    const corro = e.corroborated_by.length > 0 ? ` corroborated_by="${e.corroborated_by.join(",")}"` : "";
+    out.push(`<evidence url="${e.url}" sha256="${e.sha256 ?? "fetch_failed"}" fetched_at="${e.fetched_at}" status="${e.status}" provider="${e.provider ?? "?"}"${corro} />`);
+    out.push("");
+    out.push(`## ${i + 1}. ${escapeMd(e.title || e.url)}`);
+    out.push("");
+    if (e.snippet) {
+      out.push(`> ${e.snippet.replace(/\n/g, " ").trim()}`);
+      out.push("");
+    }
+    if (e.status === "error") {
+      out.push("_(fetch failed — citation not safe)_");
+    } else {
+      out.push(e.excerpt.trim() || "_(empty body)_");
+    }
+    out.push("");
+  }
+  out.push("---");
+  out.push("");
+  out.push("## Provenance");
+  out.push("");
+  out.push(`- depth: \`${args.depth}\``);
+  out.push(`- search providers: ${args.multiSourceEvidence.map((e) => `\`${e.provider}\``).join(", ") || `\`${args.searchProvider}\``}`);
+  out.push(`- evidence count: ${args.evidence.length}`);
+  out.push(`- fetched_at: ${args.fetchedAt}`);
+  out.push("");
+  return out.join(`
+`);
+}
+function escapeMd(s) {
+  return s.replace(/[\\<>]/g, (c) => `\\${c}`);
+}
+
 // src/ops/crawl.ts
 function gatePages(maxPages, opts) {
   if (maxPages <= 10)
@@ -6197,7 +6858,7 @@ function gatePages(maxPages, opts) {
   }
   return null;
 }
-async function run(url, opts = {}) {
+async function run4(url, opts = {}) {
   const maxPages = opts.maxPages ?? 10;
   const block = gatePages(maxPages, { apply: !!opts.apply, deepApply: !!opts.deepApply });
   if (block) {
@@ -6281,7 +6942,7 @@ var TYPE_TO_EXA_CATEGORY = {
   company: "company",
   people: "person"
 };
-async function run2(query, opts = {}) {
+async function run5(query, opts = {}) {
   const chain = filteredChain("semantic_discovery");
   const category = opts.type ? TYPE_TO_EXA_CATEGORY[opts.type] : undefined;
   const framed = reframeForKeywordSearch(query, opts.type);
@@ -6290,7 +6951,12 @@ async function run2(query, opts = {}) {
   const cKey = cacheKey({
     op: corroborate ? `discover:corroborate-${corroborate}` : "discover",
     query,
-    params: { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num }
+    params: {
+      type: opts.type ?? null,
+      sinceDays: opts.sinceDays ?? null,
+      numResults: num,
+      include_domains: opts.includeDomains ?? null
+    }
   });
   const exaAction = (provider) => provider.search(query, {
     numResults: num,
@@ -6298,8 +6964,15 @@ async function run2(query, opts = {}) {
     category,
     startPublishedDate: opts.sinceDays ? daysAgoIso(opts.sinceDays) : undefined
   });
-  const tavilyAction = (provider) => provider.search(framed, { maxResults: num, searchDepth: "advanced" });
-  const braveAction = (provider) => provider.search(framed, { count: num });
+  const tavilyAction = (provider) => provider.search(framed, {
+    maxResults: num,
+    searchDepth: "advanced",
+    includeDomains: opts.includeDomains
+  });
+  const braveAction = (provider) => provider.search(framed, {
+    count: num,
+    includeDomains: opts.includeDomains
+  });
   const ddgAction = (provider) => provider.search(framed, { count: num });
   return await withCall("discover", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(query));
@@ -6307,6 +6980,7 @@ async function run2(query, opts = {}) {
       type: opts.type ?? null,
       sinceDays: opts.sinceDays ?? null,
       numResults: num,
+      include_domains: opts.includeDomains ?? null,
       corroborate: corroborate || null
     };
     const cached = await get(cKey, CACHE_TTL_SEC.discover, { noCache: opts.noCache });
@@ -6335,9 +7009,11 @@ async function run2(query, opts = {}) {
       };
     }
     if (corroborate) {
-      const { result: result2, active: active2, participants, failures } = await runChainParallel(chain, { exa: exaAction, tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
+      const { result: result2, active: active2, participants, failures, rejected } = await runChainParallel(chain, { exa: exaAction, tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
       receipt.fallback_chain = failures;
       receipt.cache_hit = false;
+      if (rejected.length > 0)
+        receipt.rejected = rejected;
       if (active2 === null) {
         receipt.status = "error";
         return await chainFailedPayload("discover", failures);
@@ -6430,7 +7106,7 @@ function reframeForKeywordSearch(query, type) {
 }
 
 // src/ops/docs.ts
-async function run3(library, opts = {}) {
+async function run6(library, opts = {}) {
   const chain = filteredChain("library_docs");
   const cKey = cacheKey({
     op: "docs",
@@ -6532,242 +7208,6 @@ async function run3(library, opts = {}) {
       returncode: 0
     };
   });
-}
-
-// src/ops/fetch.ts
-import { createHash as createHash3, randomUUID as randomUUID2 } from "node:crypto";
-var TAG_RE2 = /<[^>]+>/g;
-var WS_RE = /\n{3,}/g;
-var ENTITY_MAP2 = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " " };
-function decodeEntities2(s) {
-  return s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (m) => ENTITY_MAP2[m] ?? m).replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(Number.parseInt(n, 16)));
-}
-async function stdlibFetch(url) {
-  const resp = await httpRequest(url, { method: "GET", timeoutMs: 30000 });
-  const text = resp.text;
-  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch ? decodeEntities2(titleMatch[1].trim()) : url;
-  const body = decodeEntities2(text.replace(TAG_RE2, `
-`)).trim().replace(WS_RE, `
-
-`);
-  return new FetchedPage({
-    url,
-    title,
-    markdown: body.slice(0, 50000),
-    provider: "urllib",
-    status: "degraded"
-  });
-}
-async function run4(url, opts = {}) {
-  const chain = filteredChain("url_fetch");
-  const cKey = cacheKey({
-    op: "fetch",
-    query: url,
-    params: { formats: opts.formats ?? null, screenshot: !!opts.screenshot }
-  });
-  const firecrawlAction = (provider) => provider.scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
-  return await withCall("fetch", {
-    provider: "firecrawl",
-    correlationId: opts.correlationId,
-    noReceipt: opts.noReceipt,
-    parentCallId: opts.parentCallId ?? null
-  }, async (receipt) => {
-    Object.assign(receipt, queryFingerprint(url));
-    receipt.params = { formats: opts.formats ?? null, screenshot: !!opts.screenshot };
-    const cached = await get(cKey, CACHE_TTL_SEC.fetch, { noCache: opts.noCache });
-    if (cached) {
-      receipt.cache_hit = true;
-      receipt.provider = cached.provider;
-      receipt.fallback_chain = cached.fallback_chain;
-      const cachedUrl = cached.page.url;
-      receipt.selected_urls = typeof cachedUrl === "string" ? [cachedUrl] : [];
-      receipt.selected_count = receipt.selected_urls.length;
-      receipt.results_count = receipt.selected_urls.length;
-      if (cached.cached_status === "degraded")
-        receipt.status = "degraded";
-      return {
-        ok: true,
-        operation: "fetch",
-        provider: cached.provider,
-        page: cached.page,
-        fallback_chain: cached.fallback_chain,
-        status: cached.cached_status,
-        cache_hit: true,
-        returncode: 0
-      };
-    }
-    const { active, result, fallback } = await runChain(chain, { firecrawl: firecrawlAction });
-    receipt.fallback_chain = [...fallback];
-    receipt.cache_hit = false;
-    if (active === null || result === null) {
-      try {
-        const page = await stdlibFetch(url);
-        receipt.fallback_chain.push({
-          from: "firecrawl",
-          to: "urllib",
-          reason: "all_providers_failed"
-        });
-        receipt.provider = "urllib";
-        receipt.status = "degraded";
-        receipt.selected_urls = [page.url];
-        receipt.selected_count = 1;
-        receipt.results_count = 1;
-        const pageJson2 = page.toJSON();
-        await set(cKey, { provider: "urllib", page: pageJson2, fallback_chain: receipt.fallback_chain, cached_status: "degraded" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: "urllib", noCache: opts.noCache });
-        return {
-          ok: true,
-          operation: "fetch",
-          provider: "urllib",
-          page: pageJson2,
-          fallback_chain: receipt.fallback_chain,
-          status: "degraded",
-          cache_hit: false,
-          returncode: 0
-        };
-      } catch (err) {
-        receipt.status = "error";
-        receipt.error = (err instanceof Error ? err.message : String(err)).slice(0, 200);
-        receipt.fallback_chain.push({
-          from: "urllib",
-          reason: "transport_error",
-          error: (err instanceof Error ? err.message : String(err)).slice(0, 200)
-        });
-        return {
-          ok: false,
-          operation: "fetch",
-          provider: null,
-          fallback_chain: receipt.fallback_chain,
-          error: `fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-          returncode: 2
-        };
-      }
-    }
-    receipt.provider = active;
-    receipt.selected_urls = result.url ? [result.url] : [];
-    receipt.selected_count = 1;
-    receipt.results_count = 1;
-    const pageJson = result.toJSON();
-    const status = result.status;
-    await set(cKey, { provider: active, page: pageJson, fallback_chain: fallback, cached_status: status === "degraded" ? "degraded" : "ok" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: active, noCache: opts.noCache });
-    return {
-      ok: true,
-      operation: "fetch",
-      provider: active,
-      page: pageJson,
-      fallback_chain: receipt.fallback_chain,
-      status: result.status,
-      cache_hit: false,
-      returncode: 0
-    };
-  });
-}
-async function runMany(urls, opts = {}) {
-  const opName = opts.op ?? "batch_fetch";
-  if (urls.length === 0) {
-    return {
-      ok: false,
-      operation: opName,
-      error: "no URLs provided",
-      returncode: 2
-    };
-  }
-  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 4, 16));
-  const parentCallId = opts.parentCallId ?? randomUUID2();
-  const started = Date.now();
-  const entries = new Array(urls.length);
-  let okCount = 0;
-  let degradedCount = 0;
-  let errorCount = 0;
-  let next = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= urls.length)
-        return;
-      const url = urls[i];
-      const childStart = Date.now();
-      try {
-        const childResult = await run4(url, {
-          formats: opts.formats,
-          screenshot: opts.screenshot,
-          correlationId: opts.correlationId,
-          noReceipt: opts.noReceipt,
-          noCache: opts.noCache,
-          parentCallId
-        });
-        const ok = childResult.ok === true;
-        const page = childResult.page;
-        const md = page?.markdown ?? "";
-        const sha = md ? createHash3("sha256").update(md, "utf8").digest("hex") : null;
-        const status = childResult.status ?? (ok ? "ok" : "error");
-        if (status === "ok")
-          okCount += 1;
-        else if (status === "degraded")
-          degradedCount += 1;
-        else
-          errorCount += 1;
-        entries[i] = {
-          url,
-          sha256: sha,
-          status,
-          provider: childResult.provider ?? null,
-          duration_ms: Date.now() - childStart,
-          title: page?.title ?? undefined,
-          bytes: md ? md.length : undefined,
-          error: ok ? undefined : childResult.error ?? undefined
-        };
-      } catch (err) {
-        errorCount += 1;
-        entries[i] = {
-          url,
-          sha256: null,
-          status: "error",
-          provider: null,
-          duration_ms: Date.now() - childStart,
-          error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 200) : String(err).slice(0, 200)
-        };
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
-  const overallStatus = errorCount === urls.length ? "error" : degradedCount + errorCount > 0 ? "degraded" : "ok";
-  const batchReceipt = {
-    ts: utcIso(),
-    call_id: parentCallId,
-    parent_call_id: null,
-    correlation_id: opts.correlationId ?? process.env.WSC_CORRELATION_ID ?? null,
-    op: opName,
-    provider: null,
-    selected_urls: urls,
-    results_count: urls.length,
-    selected_count: urls.length,
-    urls: entries.map((e) => ({
-      url: e.url,
-      sha256: e.sha256 ?? undefined,
-      status: e.status,
-      provider: e.provider ?? undefined,
-      duration_ms: e.duration_ms
-    })),
-    duration_ms: Date.now() - started,
-    started_at: utcIso(started),
-    status: overallStatus
-  };
-  if (!opts.noReceipt) {
-    try {
-      await record(batchReceipt);
-    } catch {}
-  }
-  return {
-    ok: errorCount < urls.length,
-    operation: opName,
-    parent_call_id: parentCallId,
-    urls: entries,
-    counts: { ok: okCount, degraded: degradedCount, error: errorCount, total: urls.length },
-    duration_ms: Date.now() - started,
-    status: overallStatus,
-    returncode: errorCount === urls.length ? 2 : 0
-  };
 }
 
 // src/routing.ts
@@ -6881,7 +7321,9 @@ var DISCOVERY_PATTERNS = [
   /\b(papers?|research)\s+(on|about)\b/i,
   /\b(competitors?|comparison|landscape|survey)\b/i,
   /\b(libraries?|tools?|projects?)\s+like\b/i,
-  /\b(compare|comparing|differences?\s+between)\b/i
+  /\b(compare|comparing|differences?\s+between)\b/i,
+  /\b(discussions?|opinions?|reactions?|takes?|community|voices?|sentiment|hot\s+takes?|critiques?)\b/i,
+  /\bwhat\s+(do|are)\s+people\s+(saying|think)\b/i
 ];
 var TIME_PATTERNS = [
   /\b(today|tonight|tomorrow|yesterday|now|currently|recent(ly)?|latest|news|updates?|changelog|release\s+notes?|roadmap|announcement)\b/i,
@@ -6993,142 +7435,6 @@ function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-// src/ops/search.ts
-var TIME_TO_TAVILY_DAYS = { day: 1, week: 7, month: 30, year: 365 };
-var TIME_TO_BRAVE_FRESHNESS = { day: "pd", week: "pw", month: "pm", year: "py" };
-async function run5(query, opts = {}) {
-  const chain = filteredChain("web_facts");
-  const max = opts.maxResults ?? 10;
-  const corroborate = opts.corroborate && opts.corroborate >= 2 ? opts.corroborate : 0;
-  const cKey = cacheKey({
-    op: corroborate ? `search:corroborate-${corroborate}` : "search",
-    query,
-    params: { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null }
-  });
-  const tavilyAction = (provider) => provider.search(query, {
-    maxResults: max,
-    searchDepth: "basic",
-    topic: opts.timeRange ? "news" : undefined,
-    days: opts.timeRange ? TIME_TO_TAVILY_DAYS[opts.timeRange] : undefined,
-    country: opts.country
-  });
-  const braveAction = (provider) => provider.search(query, {
-    count: max,
-    country: opts.country,
-    freshness: opts.timeRange ? TIME_TO_BRAVE_FRESHNESS[opts.timeRange] : undefined
-  });
-  const ddgAction = (provider) => provider.search(query, { count: max });
-  return await withCall("search", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
-    Object.assign(receipt, queryFingerprint(query));
-    receipt.params = {
-      max_results: max,
-      time_range: opts.timeRange ?? null,
-      country: opts.country ?? null,
-      corroborate: corroborate || null
-    };
-    const cached = await get(cKey, CACHE_TTL_SEC.search, { noCache: opts.noCache });
-    if (cached) {
-      receipt.cache_hit = true;
-      receipt.provider = cached.provider;
-      receipt.fallback_chain = cached.fallback_chain;
-      receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
-      receipt.results_count = cached.results.length;
-      receipt.selected_count = cached.results.length;
-      if (cached.multi_source_evidence)
-        receipt.multi_source_evidence = cached.multi_source_evidence;
-      if (cached.cached_status === "degraded")
-        receipt.status = "degraded";
-      return {
-        ok: true,
-        operation: "search",
-        provider: cached.provider,
-        query,
-        results: cached.results,
-        fallback_chain: cached.fallback_chain,
-        status: cached.cached_status,
-        cache_hit: true,
-        multi_source_evidence: cached.multi_source_evidence,
-        returncode: 0
-      };
-    }
-    if (corroborate) {
-      const { result: result2, active: active2, participants, failures } = await runChainParallel(chain, { tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction }, { count: corroborate });
-      receipt.fallback_chain = failures;
-      receipt.cache_hit = false;
-      if (active2 === null) {
-        receipt.status = "error";
-        return await chainFailedPayload("search", failures);
-      }
-      receipt.provider = active2;
-      receipt.selected_urls = result2.map((r) => r.url);
-      receipt.results_count = result2.length;
-      receipt.selected_count = result2.length;
-      const productive = participants.filter((p) => p.result_count > 0);
-      const multiEvidence = productive.map((p) => ({
-        provider: p.provider,
-        ...p.best_score != null ? { score: p.best_score } : {}
-      }));
-      receipt.multi_source_evidence = multiEvidence;
-      const status2 = productive.length >= 2 ? "ok" : "degraded";
-      if (status2 === "degraded")
-        receipt.status = "degraded";
-      const resultsJson2 = result2.map((r) => r.toJSON());
-      await set(cKey, {
-        provider: active2,
-        results: resultsJson2,
-        fallback_chain: failures,
-        cached_status: status2,
-        multi_source_evidence: multiEvidence
-      }, { ttlSec: CACHE_TTL_SEC.search, op: "search:corroborate", provider: active2, noCache: opts.noCache });
-      return {
-        ok: true,
-        operation: "search",
-        provider: active2,
-        query,
-        results: resultsJson2,
-        fallback_chain: failures,
-        status: status2,
-        cache_hit: false,
-        multi_source_evidence: multiEvidence,
-        participants,
-        returncode: 0
-      };
-    }
-    const { active, result, fallback } = await runChain(chain, {
-      tavily: tavilyAction,
-      brave: braveAction,
-      duckduckgo: ddgAction
-    });
-    receipt.fallback_chain = fallback;
-    receipt.cache_hit = false;
-    if (active === null || result === null) {
-      receipt.status = "error";
-      return await chainFailedPayload("search", fallback);
-    }
-    receipt.provider = active;
-    const urls = result.map((r) => r.url);
-    receipt.selected_urls = urls;
-    receipt.results_count = result.length;
-    receipt.selected_count = result.length;
-    const status = active !== chain[0] ? "degraded" : "ok";
-    if (status === "degraded")
-      receipt.status = "degraded";
-    const resultsJson = result.map((r) => r.toJSON());
-    await set(cKey, { provider: active, results: resultsJson, fallback_chain: fallback, cached_status: status }, { ttlSec: CACHE_TTL_SEC.search, op: "search", provider: active, noCache: opts.noCache });
-    return {
-      ok: true,
-      operation: "search",
-      provider: active,
-      query,
-      results: resultsJson,
-      fallback_chain: fallback,
-      status,
-      cache_hit: false,
-      returncode: 0
-    };
-  });
-}
-
 // src/ops/plan.ts
 function shellQuote(s) {
   if (/^[\w\.\/:%@\-]+$/.test(s))
@@ -7147,7 +7453,7 @@ function explain(query, opts = {}) {
     returncode: 0
   };
 }
-async function run6(query, opts = {}) {
+async function run7(query, opts = {}) {
   const router = getRouter(opts.routerName ?? "rule");
   const decision = router.classify(query, {
     prefer: opts.prefer,
@@ -7157,19 +7463,19 @@ async function run6(query, opts = {}) {
   let subPayload;
   switch (decision.recommended_op) {
     case "docs":
-      subPayload = await run3(query, { correlationId, noReceipt: opts.noReceipt });
+      subPayload = await run6(query, { correlationId, noReceipt: opts.noReceipt });
       break;
     case "discover":
-      subPayload = await run2(query, { correlationId, noReceipt: opts.noReceipt });
+      subPayload = await run5(query, { correlationId, noReceipt: opts.noReceipt });
       break;
     case "fetch":
-      subPayload = await run4(query, { correlationId, noReceipt: opts.noReceipt });
+      subPayload = await run2(query, { correlationId, noReceipt: opts.noReceipt });
       break;
     case "crawl":
-      subPayload = await run(query, { correlationId, noReceipt: opts.noReceipt });
+      subPayload = await run4(query, { correlationId, noReceipt: opts.noReceipt });
       break;
     case "search":
-      subPayload = await run5(query, { correlationId, noReceipt: opts.noReceipt });
+      subPayload = await run(query, { correlationId, noReceipt: opts.noReceipt });
       break;
     default:
       subPayload = {
@@ -7196,7 +7502,7 @@ async function run6(query, opts = {}) {
 }
 
 // src/ops/verify.ts
-async function run7(urls, opts = {}) {
+async function run8(urls, opts = {}) {
   let targetUrls = urls;
   if (opts.fromReceipt) {
     const events = (await tail({ lines: 1000 })).events;
@@ -7253,6 +7559,48 @@ async function run7(urls, opts = {}) {
     returncode: result.returncode,
     ...opts.fromReceipt ? { from_receipt: opts.fromReceipt } : {}
   };
+}
+
+// src/domains.ts
+var SOURCE_PRESETS = {
+  hn: ["news.ycombinator.com"],
+  reddit: ["reddit.com", "old.reddit.com"],
+  x: ["x.com", "twitter.com"],
+  gh: ["github.com"],
+  so: ["stackoverflow.com", "stackexchange.com"],
+  arxiv: ["arxiv.org"]
+};
+function expandSource(spec) {
+  if (!spec)
+    return [];
+  const segs = spec.split("+").map((s) => s.trim()).filter(Boolean);
+  const seen = new Set;
+  const out = [];
+  for (const s of segs) {
+    const list = SOURCE_PRESETS[s] ?? [s];
+    for (const d of list) {
+      if (!seen.has(d)) {
+        seen.add(d);
+        out.push(d);
+      }
+    }
+  }
+  return out;
+}
+function resolveIncludeDomains(source, include) {
+  const expanded = expandSource(source);
+  const merged = [...expanded, ...include ?? []];
+  if (merged.length === 0)
+    return;
+  const seen = new Set;
+  const out = [];
+  for (const d of merged) {
+    if (!seen.has(d)) {
+      seen.add(d);
+      out.push(d);
+    }
+  }
+  return out;
 }
 
 // src/cli.ts
@@ -7332,6 +7680,14 @@ function renderHuman(payload) {
 `);
     else
       console.log(`removed ${payload.removed_count ?? 0} entries (${payload.size_human ?? "0 B"})`);
+    return;
+  }
+  if (op === "deepdive") {
+    if (payload.markdown)
+      console.log(payload.markdown);
+    else if (payload.error)
+      process.stderr.write(`${payload.error}
+`);
     return;
   }
   process.stdout.write(JSON.stringify(payload, null, 2) + `
@@ -7522,7 +7878,7 @@ program2.command("plan <query>").description("auto-route a query to the right to
   if (opts.explain) {
     emit(globals, explain(query, { prefer: opts.prefer, budgetOverride: globals.budget, routerName: opts.router }));
   }
-  const result = await run6(query, {
+  const result = await run7(query, {
     prefer: opts.prefer,
     budgetOverride: globals.budget,
     routerName: opts.router,
@@ -7532,7 +7888,7 @@ program2.command("plan <query>").description("auto-route a query to the right to
 });
 program2.command("docs <library>").description("fetch official library docs via Context7").option("--topic <topic>").option("--version <ver>").action(async (library, opts) => {
   const globals = getGlobals();
-  const result = await run3(library, {
+  const result = await run6(library, {
     topic: opts.topic,
     version: opts.version,
     noReceipt: globals.noReceipt,
@@ -7540,13 +7896,15 @@ program2.command("docs <library>").description("fetch official library docs via 
   });
   emit(globals, result);
 });
-program2.command("discover <query>").description("semantic discovery via Exa").addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"])).option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10)).option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).action(async (query, opts) => {
+program2.command("discover <query>").description("semantic discovery via Exa").addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"])).option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10)).option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).option("--include-domain <d>", "restrict to this domain (repeatable; not honored by Exa primary)", (val, prev = []) => [...prev, val], []).option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)").action(async (query, opts) => {
   const globals = getGlobals();
-  const result = await run2(query, {
+  const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
+  const result = await run5(query, {
     type: opts.type,
     sinceDays: opts.since,
     numResults: opts.numResults,
     corroborate: opts.corroborate,
+    includeDomains,
     noReceipt: globals.noReceipt,
     noCache: globals.noCache
   });
@@ -7565,7 +7923,7 @@ program2.command("fetch <url> [moreUrls...]").description("clean a known URL via
     });
     emit(globals, result2);
   }
-  const result = await run4(url, {
+  const result = await run2(url, {
     formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
     screenshot: !!opts.screenshot,
     noReceipt: globals.noReceipt,
@@ -7575,7 +7933,7 @@ program2.command("fetch <url> [moreUrls...]").description("clean a known URL via
 });
 program2.command("verify [urls...]").description("fetch URLs and emit sha256-stamped proof receipts (use before citing in writeups)").option("--from-receipt <call_id>", "verify the selected_urls of a prior receipt").option("--concurrency <n>", "max in-flight fetches (default 4)", (v) => Number.parseInt(v, 10)).action(async (urls, opts) => {
   const globals = getGlobals();
-  const result = await run7(urls ?? [], {
+  const result = await run8(urls ?? [], {
     fromReceipt: opts.fromReceipt,
     concurrency: opts.concurrency,
     noReceipt: globals.noReceipt,
@@ -7584,7 +7942,7 @@ program2.command("verify [urls...]").description("fetch URLs and emit sha256-sta
   emit(globals, result);
 });
 program2.command("crawl <url>").description("crawl a site via Firecrawl (gated)").option("--max-pages <n>", "default 10", (v) => Number.parseInt(v, 10), 10).option("--include-paths <path>", "repeatable", (val, prev = []) => [...prev, val], []).option("--exclude-paths <path>", "repeatable", (val, prev = []) => [...prev, val], []).option("--format <fmt>", "repeatable", (val, prev = []) => [...prev, val], []).option("--apply", "required for crawls of 11–100 pages").option("--i-know-this-burns-credits", "required for crawls > 100 pages").action(async (url, opts) => {
-  const result = await run(url, {
+  const result = await run4(url, {
     maxPages: opts.maxPages,
     includePaths: opts.includePaths.length > 0 ? opts.includePaths : undefined,
     excludePaths: opts.excludePaths.length > 0 ? opts.excludePaths : undefined,
@@ -7595,13 +7953,27 @@ program2.command("crawl <url>").description("crawl a site via Firecrawl (gated)"
   });
   emit(getGlobals(), result);
 });
-program2.command("search <query>").description("general web search via Tavily").option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--country <code>").option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).action(async (query, opts) => {
+program2.command("search <query>").description("general web search via Tavily").option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--country <code>").option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) => Number.parseInt(v, 10)).option("--include-domain <d>", "restrict to this domain (repeatable)", (val, prev = []) => [...prev, val], []).option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)").action(async (query, opts) => {
   const globals = getGlobals();
-  const result = await run5(query, {
+  const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
+  const result = await run(query, {
     maxResults: opts.maxResults,
     timeRange: opts.time,
     country: opts.country,
     corroborate: opts.corroborate,
+    includeDomains,
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
+  });
+  emit(globals, result);
+});
+program2.command("deepdive <query>").description("comprehensive briefing macro: search + fetch + format with <evidence> tags").addOption(new Option("--depth <level>", "shallow|standard|deep").choices(["shallow", "standard", "deep"]).default("standard")).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--include-domain <d>", "restrict search to this domain (repeatable)", (val, prev = []) => [...prev, val], []).option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)").action(async (query, opts) => {
+  const globals = getGlobals();
+  const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
+  const result = await run3(query, {
+    depth: opts.depth,
+    timeRange: opts.time,
+    includeDomains,
     noReceipt: globals.noReceipt,
     noCache: globals.noCache
   });

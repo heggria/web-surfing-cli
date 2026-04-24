@@ -24,12 +24,13 @@ If installed via npm, you can also invoke it by absolute path: `~/.npm-global/bi
 | User intent                                   | Subcommand        | Primary provider | Fallback chain                                  |
 |-----------------------------------------------|-------------------|------------------|-------------------------------------------------|
 | Official docs of a library / framework / API  | `wsc docs`        | Context7         | Firecrawl GitHub README → urllib raw README     |
-| Find similar projects / papers / companies / people | `wsc discover` | Exa              | Tavily (re-prompted) → Brave → DuckDuckGo HTML  |
+| Find similar projects / papers / companies / people / discussions / opinions | `wsc discover` | Exa              | Tavily (re-prompted) → Brave → DuckDuckGo HTML  |
 | Current web facts / news / pricing / release notes  | `wsc search`   | Tavily           | Brave → DuckDuckGo HTML                         |
 | Clean a known URL into markdown               | `wsc fetch <url>` | Firecrawl        | stdlib urllib + html.parser (degraded)          |
 | Clean MULTIPLE URLs in parallel               | `wsc fetch URL1 URL2 ...` | Firecrawl | same chain per URL; concurrent (default 4)      |
 | Crawl a site or section                       | `wsc crawl`       | Firecrawl        | (no fallback — fail loud)                       |
 | Verify URLs before citing in a writeup        | `wsc verify`      | (uses fetch chain) | sha256 + fetched_at proof per URL; supports `--from-receipt` |
+| Comprehensive briefing on a topic (one round trip) | `wsc deepdive` | (search + fetch macro) | search + corroborate + fetch + format with `<evidence>` tags |
 | Not sure which lane → ask wsc to route        | `wsc plan <q>`    | (rule router)    | dispatches to one of the above                  |
 
 When uncertain, run `wsc plan "<query>" --explain` first — it prints the routing decision and the candidate `would_run` command without spending API credits.
@@ -171,12 +172,30 @@ wsc discover "research papers on speculative decoding" --type paper --since 90
 # Pull a single page into clean markdown
 wsc fetch https://docs.anthropic.com/claude/docs/extended-thinking
 
+# Pull multiple pages in parallel
+wsc fetch https://anthropic.com/news https://docs.anthropic.com/en/release-notes/api
+
 # Crawl a docs site (gated)
 wsc crawl https://docs.firecrawl.dev --max-pages 30 --apply
 
 # Current state / news
 wsc search "claude 4.7 latest features" --time week
 wsc search "supabase pricing"
+
+# Targeted source filter (M3)
+wsc search "claude code subagents" --source hn+reddit --max-results 10
+wsc search "vector db comparison" --include-domain news.ycombinator.com --include-domain github.com
+
+# High-confidence (cross-validated) search
+wsc search "claude opus 4.7 release date" --time week --corroborate 3
+
+# Verify URLs before citing in a writeup
+wsc verify https://anthropic.com/news/claude-opus-4-7
+wsc verify --from-receipt $(wsc receipts tail --tool search --lines 1 --json | jq -r '.events[0].call_id')
+
+# One-shot briefing with sha256-stamped evidence (M3)
+wsc deepdive "managed agents anthropic 2026" --depth standard
+wsc deepdive "claude code best practices 2026" --depth deep --time week
 
 # Auto-route — useful when the query intent is ambiguous
 wsc plan "react useState vs useReducer performance" --explain
@@ -188,6 +207,7 @@ wsc config enable firecrawl
 
 # What did I burn today?
 wsc receipts summary --days 1 --cost
+wsc cache stats
 ```
 
 ## When wsc Is Not Enough

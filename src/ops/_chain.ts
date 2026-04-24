@@ -89,6 +89,8 @@ export interface ParallelChainResult {
   participants: Array<{ provider: string; result_count: number; best_score: number | null }>;
   /** Providers that errored or were skipped (missing_key/disabled/rate_limit/etc). */
   failures: FallbackStep[];
+  /** URLs received but not included in the canonical result (dedup loss / empty URL / etc). */
+  rejected: Array<{ url: string; reason: string }>;
 }
 
 /**
@@ -125,7 +127,7 @@ export async function runChainParallel(
   }
 
   if (candidates.length === 0) {
-    return { result: [], active: null, participants: [], failures };
+    return { result: [], active: null, participants: [], failures, rejected: [] };
   }
 
   // Step 2: run all candidates in parallel.
@@ -169,15 +171,20 @@ export async function runChainParallel(
   }
 
   if (perProvider.length === 0) {
-    return { result: [], active: null, participants: [], failures };
+    return { result: [], active: null, participants: [], failures, rejected: [] };
   }
 
-  // Step 4: merge + dedupe by urlNormalized, attach corroboratedBy.
+  // Step 4: merge + dedupe by urlNormalized, attach corroboratedBy. Track
+  // dedup losses in `rejected` so receipts can show overlap density.
   const seen = new Map<string, NormalizedResult>();
+  const rejected: Array<{ url: string; reason: string }> = [];
   for (const { provider, results } of perProvider) {
     for (const r of results) {
       const key = r.urlNormalized || r.url;
-      if (!key) continue;
+      if (!key) {
+        rejected.push({ url: r.url || "(empty)", reason: "empty_url" });
+        continue;
+      }
       const existing = seen.get(key);
       if (!existing) {
         // First sighting: this provider is the canonical.
@@ -197,6 +204,7 @@ export async function runChainParallel(
         seen.set(key, cloned);
       } else if (provider !== existing.provider && !existing.corroboratedBy.includes(provider)) {
         existing.corroboratedBy.push(provider);
+        rejected.push({ url: r.url, reason: `merged_into_${existing.provider}` });
       }
     }
   }
@@ -225,6 +233,7 @@ export async function runChainParallel(
     active: perProvider[0]!.provider,
     participants,
     failures,
+    rejected,
   };
 }
 

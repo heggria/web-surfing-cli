@@ -23,6 +23,8 @@ export interface ProviderMeta {
   role: ProviderRole;
   fallbackRoles: ProviderRole[];
   envKeys: string[];
+  /** Optional override for which keys.toml section holds this provider's api_key. Default = provider name. */
+  fileSection?: string;
   homepage: string;
 }
 
@@ -56,6 +58,14 @@ export const PROVIDERS: Record<string, ProviderMeta> = {
     envKeys: ["TAVILY_API_KEY"],
     homepage: "https://app.tavily.com/",
   },
+  "tavily-extract": {
+    needsKey: true,
+    role: "url_fetch",
+    fallbackRoles: [],
+    envKeys: ["TAVILY_API_KEY"],
+    fileSection: "tavily",
+    homepage: "https://app.tavily.com/",
+  },
   firecrawl: {
     needsKey: true,
     role: "url_fetch",
@@ -84,7 +94,7 @@ export const ROLE_FALLBACK_CHAIN: Record<ProviderRole, string[]> = {
   semantic_discovery: ["exa", "tavily", "brave", "duckduckgo"],
   web_facts: ["tavily", "brave", "duckduckgo"],
   web_facts_zero_key: ["duckduckgo"],
-  url_fetch: ["firecrawl"],
+  url_fetch: ["firecrawl", "tavily-extract"],
   url_crawl: ["firecrawl"],
 };
 
@@ -198,7 +208,8 @@ export function loadKeys(): ProviderKeys {
       apiKeys[provider] = envValue;
       continue;
     }
-    const section = file[provider];
+    const sectionKey = meta.fileSection ?? provider;
+    const section = file[sectionKey];
     if (section && typeof section === "object") {
       const k = (section as Record<string, unknown>)["api_key"];
       if (typeof k === "string" && k.trim()) {

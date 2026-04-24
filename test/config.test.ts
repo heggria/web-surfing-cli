@@ -118,6 +118,7 @@ describe("config.doctor", () => {
     process.env.FIRECRAWL_API_KEY = "y";
     const out = config.doctor();
     expect(out.role_fallback_chains.semantic_discovery[0]).toBe("tavily");
-    expect(out.role_fallback_chains.url_fetch).toEqual(["firecrawl"]);
+    // url_fetch chain: firecrawl primary, tavily-extract fallback (also wants TAVILY_API_KEY).
+    expect(out.role_fallback_chains.url_fetch).toEqual(["firecrawl", "tavily-extract"]);
   });
 });

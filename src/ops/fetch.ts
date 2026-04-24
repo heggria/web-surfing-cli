@@ -5,7 +5,7 @@ import { record, utcIso, withCall } from "../audit.js";
 import * as cache from "../cache.js";
 import { filteredChain, queryFingerprint, runChain } from "./_chain.js";
 import type { Action, FallbackStep } from "./_chain.js";
-import { FetchedPage, FirecrawlProvider, httpRequest } from "../providers/index.js";
+import { FetchedPage, FirecrawlProvider, TavilyExtractProvider, httpRequest } from "../providers/index.js";
 import { normalizeUrl } from "../_url.js";
 
 export interface FetchOptions {
@@ -62,6 +62,9 @@ export async function run(url: string, opts: FetchOptions = {}): Promise<Record<
   const firecrawlAction: Action<FetchedPage> = (provider) =>
     (provider as FirecrawlProvider).scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
 
+  const tavilyExtractAction: Action<FetchedPage> = (provider) =>
+    (provider as TavilyExtractProvider).extract(url);
+
   return await withCall(
     "fetch",
     {
@@ -96,7 +99,10 @@ export async function run(url: string, opts: FetchOptions = {}): Promise<Record<
         };
       }
 
-      const { active, result, fallback } = await runChain(chain, { firecrawl: firecrawlAction });
+      const { active, result, fallback } = await runChain(chain, {
+        firecrawl: firecrawlAction,
+        "tavily-extract": tavilyExtractAction,
+      });
       receipt.fallback_chain = [...fallback];
       receipt.cache_hit = false;
 

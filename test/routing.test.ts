@@ -33,6 +33,12 @@ const CASES: Array<[string, string]> = [
   ["libraries like firecrawl", "discover"],
   ["similar to Hermit governed agent runtime", "discover"],
   ["competitors of langchain", "discover"],
+  // Discussions / opinions / community → discover (M4 of v0.3)
+  ["discussions on managed agents", "discover"],
+  ["opinions on claude code subagents", "discover"],
+  ["community reaction to claude opus 4.7", "discover"],
+  ["what are people saying about claude routines", "discover"],
+  ["hot takes on cursor 4 release", "discover"],
   // Web facts / news
   ["claude 4.7 latest features", "search"],
   ["news on apple m4 mac mini", "search"],

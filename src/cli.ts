@@ -10,6 +10,7 @@ import { Command, Option } from "commander";
 import * as audit from "./audit.js";
 import * as cache from "./cache.js";
 import * as config from "./config.js";
+import * as deepdive from "./ops/deepdive.js";
 import * as crawl from "./ops/crawl.js";
 import * as discover from "./ops/discover.js";
 import * as docs from "./ops/docs.js";
@@ -17,6 +18,7 @@ import * as fetchOp from "./ops/fetch.js";
 import * as plan from "./ops/plan.js";
 import * as search from "./ops/search.js";
 import * as verify from "./ops/verify.js";
+import { resolveIncludeDomains } from "./domains.js";
 
 const VERSION = "0.2.0";
 
@@ -95,6 +97,13 @@ function renderHuman(payload: Record<string, unknown>): void {
   if (op === "cache.clear") {
     if (payload.error) process.stderr.write(`${payload.error}\n`);
     else console.log(`removed ${payload.removed_count ?? 0} entries (${payload.size_human ?? "0 B"})`);
+    return;
+  }
+  if (op === "deepdive") {
+    // Print the markdown bundle as the primary deliverable; everything else
+    // is governance metadata available via --json.
+    if (payload.markdown) console.log(payload.markdown);
+    else if (payload.error) process.stderr.write(`${payload.error}\n`);
     return;
   }
   process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
@@ -387,13 +396,22 @@ program
   .option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) =>
     Number.parseInt(v, 10),
   )
+  .option(
+    "--include-domain <d>",
+    "restrict to this domain (repeatable; not honored by Exa primary)",
+    (val: string, prev: string[] = []) => [...prev, val],
+    [] as string[],
+  )
+  .option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)")
   .action(async (query, opts) => {
     const globals = getGlobals();
+    const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
     const result = await discover.run(query, {
       type: opts.type,
       sinceDays: opts.since,
       numResults: opts.numResults,
       corroborate: opts.corroborate,
+      includeDomains,
       noReceipt: globals.noReceipt,
       noCache: globals.noCache,
     });
@@ -479,13 +497,48 @@ program
   .option("--corroborate <n>", "fan out to N providers in parallel for cross-validation (default off)", (v) =>
     Number.parseInt(v, 10),
   )
+  .option(
+    "--include-domain <d>",
+    "restrict to this domain (repeatable)",
+    (val: string, prev: string[] = []) => [...prev, val],
+    [] as string[],
+  )
+  .option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)")
   .action(async (query, opts) => {
     const globals = getGlobals();
+    const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
     const result = await search.run(query, {
       maxResults: opts.maxResults,
       timeRange: opts.time,
       country: opts.country,
       corroborate: opts.corroborate,
+      includeDomains,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
+    });
+    emit(globals, result);
+  });
+
+// deepdive
+program
+  .command("deepdive <query>")
+  .description("comprehensive briefing macro: search + fetch + format with <evidence> tags")
+  .addOption(new Option("--depth <level>", "shallow|standard|deep").choices(["shallow", "standard", "deep"]).default("standard"))
+  .addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"]))
+  .option(
+    "--include-domain <d>",
+    "restrict search to this domain (repeatable)",
+    (val: string, prev: string[] = []) => [...prev, val],
+    [] as string[],
+  )
+  .option("--source <preset>", "shortcut: hn|reddit|x|gh|so|arxiv (or hn+reddit etc.)")
+  .action(async (query, opts) => {
+    const globals = getGlobals();
+    const includeDomains = resolveIncludeDomains(opts.source, opts.includeDomain);
+    const result = await deepdive.run(query, {
+      depth: opts.depth,
+      timeRange: opts.time,
+      includeDomains,
       noReceipt: globals.noReceipt,
       noCache: globals.noCache,
     });

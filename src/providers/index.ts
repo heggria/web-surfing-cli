@@ -6,13 +6,14 @@ import { Context7Provider } from "./context7.js";
 import { DuckDuckGoProvider } from "./duckduckgo.js";
 import { ExaProvider } from "./exa.js";
 import { FirecrawlProvider } from "./firecrawl.js";
-import { TavilyProvider } from "./tavily.js";
+import { TavilyExtractProvider, TavilyProvider } from "./tavily.js";
 import { DisabledError, MissingKeyError, Provider } from "./base.js";
 
 const FACTORY: Record<string, new (apiKey?: string) => Provider> = {
   context7: Context7Provider,
   exa: ExaProvider,
   tavily: TavilyProvider,
+  "tavily-extract": TavilyExtractProvider,
   firecrawl: FirecrawlProvider,
   brave: BraveProvider,
   duckduckgo: DuckDuckGoProvider,
@@ -40,4 +41,4 @@ export { Context7Provider } from "./context7.js";
 export { DuckDuckGoProvider } from "./duckduckgo.js";
 export { ExaProvider } from "./exa.js";
 export { FirecrawlProvider } from "./firecrawl.js";
-export { TavilyProvider } from "./tavily.js";
+export { TavilyExtractProvider, TavilyProvider } from "./tavily.js";

@@ -23,6 +23,8 @@ export interface DiscoverOptions {
   type?: "code" | "paper" | "company" | "people";
   sinceDays?: number;
   numResults?: number;
+  /** Restrict results to these domains (Tavily/Brave fallback only — Exa lacks native support). */
+  includeDomains?: string[];
   /** Fan out to up to N providers in parallel and cross-validate results. 0/undefined = single-provider chain. */
   corroborate?: number;
   correlationId?: string;
@@ -47,7 +49,12 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
   const cKey = cache.cacheKey({
     op: corroborate ? `discover:corroborate-${corroborate}` : "discover",
     query,
-    params: { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num },
+    params: {
+      type: opts.type ?? null,
+      sinceDays: opts.sinceDays ?? null,
+      numResults: num,
+      include_domains: opts.includeDomains ?? null,
+    },
   });
 
   const exaAction: Action<NormalizedResult[]> = (provider) =>
@@ -59,10 +66,17 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
     });
 
   const tavilyAction: Action<NormalizedResult[]> = (provider) =>
-    (provider as TavilyProvider).search(framed, { maxResults: num, searchDepth: "advanced" });
+    (provider as TavilyProvider).search(framed, {
+      maxResults: num,
+      searchDepth: "advanced",
+      includeDomains: opts.includeDomains,
+    });
 
   const braveAction: Action<NormalizedResult[]> = (provider) =>
-    (provider as BraveProvider).search(framed, { count: num });
+    (provider as BraveProvider).search(framed, {
+      count: num,
+      includeDomains: opts.includeDomains,
+    });
 
   const ddgAction: Action<NormalizedResult[]> = (provider) =>
     (provider as DuckDuckGoProvider).search(framed, { count: num });
@@ -76,6 +90,7 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
         type: opts.type ?? null,
         sinceDays: opts.sinceDays ?? null,
         numResults: num,
+        include_domains: opts.includeDomains ?? null,
         corroborate: corroborate || null,
       };
 
@@ -105,13 +120,14 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
 
       // --- Corroborate (parallel fan-out) path ---
       if (corroborate) {
-        const { result, active, participants, failures } = await runChainParallel(
+        const { result, active, participants, failures, rejected } = await runChainParallel(
           chain,
           { exa: exaAction, tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction },
           { count: corroborate },
         );
         receipt.fallback_chain = failures;
         receipt.cache_hit = false;
+        if (rejected.length > 0) receipt.rejected = rejected;
         if (active === null) {
           receipt.status = "error";
           return await chainFailedPayload("discover", failures);

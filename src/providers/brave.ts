@@ -19,6 +19,8 @@ export interface BraveSearchOptions {
   count?: number;
   country?: string;
   freshness?: "pd" | "pw" | "pm" | "py";
+  /** Brave has no native include_domains; we inject `site:a OR site:b` into q. */
+  includeDomains?: string[];
   timeoutMs?: number;
 }
 
@@ -38,7 +40,12 @@ export class BraveProvider extends Provider {
   }
 
   async search(query: string, opts: BraveSearchOptions = {}): Promise<NormalizedResult[]> {
-    const params: Record<string, string> = { q: query, count: String(opts.count ?? 10) };
+    let q = query;
+    if (opts.includeDomains && opts.includeDomains.length > 0) {
+      const sites = opts.includeDomains.map((d) => `site:${d}`).join(" OR ");
+      q = `(${sites}) ${query}`;
+    }
+    const params: Record<string, string> = { q, count: String(opts.count ?? 10) };
     if (opts.country) params.country = opts.country;
     if (opts.freshness) params.freshness = opts.freshness;
     const response = await httpRequest(ENDPOINT, {

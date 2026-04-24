@@ -7,6 +7,7 @@ setupTestEnv();
 import { readFileSync } from "node:fs";
 import * as audit from "../src/audit.js";
 import * as crawlOp from "../src/ops/crawl.js";
+import * as deepdiveOp from "../src/ops/deepdive.js";
 import * as discoverOp from "../src/ops/discover.js";
 import * as fetchOp from "../src/ops/fetch.js";
 import * as planOp from "../src/ops/plan.js";
@@ -470,5 +471,221 @@ describe("verify.run", () => {
     expect(out.ok).toBe(false);
     expect(out.returncode).toBe(2);
     expect(String(out.error)).toContain("nope-not-real");
+  });
+});
+
+// --- domain filter (M3) --------------------------------------------------
+
+describe("search.run with includeDomains", () => {
+  test("forwards include_domains to Tavily request body", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    let capturedBody: string | undefined;
+    const handler = (url: string, init: RequestInit | undefined) => {
+      if (url.includes("tavily.com")) {
+        capturedBody = typeof init?.body === "string" ? init.body : undefined;
+        return jsonResponse({ results: [{ url: "https://news.ycombinator.com/x", title: "X", content: "..." }] });
+      }
+      return jsonResponse({});
+    };
+    await withFakeFetch(handler, () =>
+      searchOp.run("claude best practices", { includeDomains: ["news.ycombinator.com", "reddit.com"] }),
+    );
+    expect(capturedBody).toBeDefined();
+    const parsed = JSON.parse(capturedBody!);
+    expect(parsed.include_domains).toEqual(["news.ycombinator.com", "reddit.com"]);
+  });
+
+  test("includeDomains is part of cache key", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    let httpCalls = 0;
+    const handler = () => {
+      httpCalls += 1;
+      return jsonResponse({ results: [{ url: "https://a.com", title: "A", content: "...", score: 0.5 }] });
+    };
+    await withFakeFetch(handler, () => searchOp.run("dom-key-test", { includeDomains: ["a.com"] }));
+    await withFakeFetch(handler, () => searchOp.run("dom-key-test", { includeDomains: ["b.com"] }));
+    expect(httpCalls).toBe(2);
+  });
+});
+
+describe("brave includeDomains injection", () => {
+  test("Brave provider injects site: into q when includeDomains set", async () => {
+    process.env.BRAVE_API_KEY = "brave_test";
+    let capturedUrl: string | undefined;
+    const handler = (url: string) => {
+      capturedUrl = url;
+      return jsonResponse({ web: { results: [] } });
+    };
+    const { BraveProvider } = await import("../src/providers/brave.js");
+    await withFakeFetch(handler, async () => {
+      await new BraveProvider("brave_test").search("hello", { includeDomains: ["a.com", "b.com"] });
+      return null;
+    });
+    expect(capturedUrl).toBeDefined();
+    const u = new URL(capturedUrl!);
+    const q = u.searchParams.get("q") ?? "";
+    expect(q).toContain("site:a.com");
+    expect(q).toContain("site:b.com");
+    expect(q).toContain("OR");
+    expect(q).toContain("hello");
+  });
+});
+
+// --- deepdive (M3) -------------------------------------------------------
+
+describe("deepdive.run", () => {
+  test("standard depth: search + fetch each, emits markdown with <evidence> blocks", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    process.env.BRAVE_API_KEY = "brave_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({
+          results: [
+            { url: "https://example.com/a", title: "A", content: "snippet a", score: 0.9 },
+            { url: "https://example.com/b", title: "B", content: "snippet b", score: 0.8 },
+          ],
+        });
+      }
+      if (url.includes("brave.com")) {
+        return jsonResponse({
+          web: { results: [{ url: "https://example.com/a", title: "A (brave)", description: "..." }] },
+        });
+      }
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "# Page body\nReal content here", metadata: { title: "T", sourceURL: "https://example.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => deepdiveOp.run("test-deepdive", { depth: "standard" }));
+    expect(out.ok).toBe(true);
+    expect(out.operation).toBe("deepdive");
+    expect(out.depth).toBe("standard");
+    expect(typeof out.markdown).toBe("string");
+    expect((out.markdown as string)).toContain("# Deepdive: test-deepdive");
+    expect((out.markdown as string)).toContain("<evidence ");
+    expect((out.markdown as string)).toContain("sha256=");
+    const evidence = out.evidence as Array<{ url: string; sha256: string | null; status: string }>;
+    expect(evidence.length).toBeGreaterThan(0);
+    expect(evidence.every((e) => typeof e.sha256 === "string" && e.sha256.length === 64)).toBe(true);
+  });
+
+  test("shallow depth: no corroborate, top 3 sources", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({
+          results: [
+            { url: "https://x.com/1", title: "1", content: "...", score: 0.5 },
+            { url: "https://x.com/2", title: "2", content: "...", score: 0.4 },
+            { url: "https://x.com/3", title: "3", content: "...", score: 0.3 },
+            { url: "https://x.com/4", title: "4", content: "...", score: 0.2 },
+          ],
+        });
+      }
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "page body", metadata: { title: "T", sourceURL: "https://x.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => deepdiveOp.run("shallow-test", { depth: "shallow" }));
+    expect(out.ok).toBe(true);
+    const counts = out.counts as Record<string, number>;
+    expect(counts.total).toBe(3); // top 3
+  });
+
+  test("writes deepdive receipt with verified_urls", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({ results: [{ url: "https://q.com/x", title: "X", content: "..." }] });
+      }
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "body", metadata: { title: "T", sourceURL: "https://q.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    await withFakeFetch(handler, () => deepdiveOp.run("receipt-test", { depth: "shallow" }));
+    const events = (await audit.tail({ lines: 20 })).events;
+    const dd = events.filter((e) => e.op === "deepdive");
+    expect(dd.length).toBeGreaterThan(0);
+    const last = dd[dd.length - 1]!;
+    const verified = last.verified_urls as Array<{ url: string; sha256: string }>;
+    expect(verified.length).toBeGreaterThan(0);
+    expect(verified[0]!.sha256.length).toBe(64);
+  });
+});
+
+// --- rejected[] in receipt (M4) ------------------------------------------
+
+describe("corroborate rejected dedup tracking", () => {
+  test("when 2 providers return same URL, rejected[] records the duplicate with merged_into reason", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.BRAVE_API_KEY = "brave_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({
+          results: [
+            { url: "https://shared.com/x", title: "Tavily X", content: "...", score: 0.9 },
+            { url: "https://only-tavily.com", title: "T-only", content: "...", score: 0.5 },
+          ],
+        });
+      }
+      if (url.includes("brave.com")) {
+        return jsonResponse({
+          web: {
+            results: [
+              { url: "https://shared.com/x", title: "Brave X", description: "..." },
+              { url: "https://only-brave.com", title: "B-only", description: "..." },
+            ],
+          },
+        });
+      }
+      return jsonResponse({});
+    };
+    await withFakeFetch(handler, () => searchOp.run("rejected-test", { corroborate: 2 }));
+    const events = (await audit.tail({ lines: 5 })).events;
+    const last = events[events.length - 1]!;
+    const rejected = last.rejected as Array<{ url: string; reason: string }> | undefined;
+    expect(rejected).toBeDefined();
+    expect(rejected!.length).toBeGreaterThan(0);
+    const dupes = rejected!.filter((r) => r.reason.startsWith("merged_into_"));
+    expect(dupes.length).toBe(1);
+    expect(dupes[0]!.url).toBe("https://shared.com/x");
+  });
+});
+
+// --- tavily-extract fallback (M4) ----------------------------------------
+
+describe("fetch with tavily-extract fallback", () => {
+  test("falls back to tavily-extract when firecrawl errors and TAVILY_API_KEY present", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    // Note: no FIRECRAWL_API_KEY → firecrawl missing key, chain falls to tavily-extract.
+    const handler = (url: string) => {
+      if (url.includes("api.tavily.com/extract")) {
+        return jsonResponse({
+          results: [{ url: "https://example.com", raw_content: "Page Title\nThe page body content goes here." }],
+          failed_results: [],
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => fetchOp.run("https://example.com"));
+    expect(out.ok).toBe(true);
+    expect(out.provider).toBe("tavily-extract");
+    expect(out.status).toBe("degraded");
+    const page = out.page as Record<string, unknown>;
+    expect(String(page.markdown)).toContain("page body content");
   });
 });

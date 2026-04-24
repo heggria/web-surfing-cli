@@ -13,6 +13,8 @@ export interface SearchOptions {
   maxResults?: number;
   timeRange?: "day" | "week" | "month" | "year";
   country?: string;
+  /** Restrict results to these domains (Tavily include_domains; Brave site: injection). */
+  includeDomains?: string[];
   /** Fan out to up to N providers in parallel and cross-validate results. 0/undefined = single-provider chain. */
   corroborate?: number;
   correlationId?: string;
@@ -35,7 +37,12 @@ export async function run(query: string, opts: SearchOptions = {}): Promise<Reco
   const cKey = cache.cacheKey({
     op: corroborate ? `search:corroborate-${corroborate}` : "search",
     query,
-    params: { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null },
+    params: {
+      max_results: max,
+      time_range: opts.timeRange ?? null,
+      country: opts.country ?? null,
+      include_domains: opts.includeDomains ?? null,
+    },
   });
 
   const tavilyAction: Action<NormalizedResult[]> = (provider) =>
@@ -45,6 +52,7 @@ export async function run(query: string, opts: SearchOptions = {}): Promise<Reco
       topic: opts.timeRange ? "news" : undefined,
       days: opts.timeRange ? TIME_TO_TAVILY_DAYS[opts.timeRange] : undefined,
       country: opts.country,
+      includeDomains: opts.includeDomains,
     });
 
   const braveAction: Action<NormalizedResult[]> = (provider) =>
@@ -52,6 +60,7 @@ export async function run(query: string, opts: SearchOptions = {}): Promise<Reco
       count: max,
       country: opts.country,
       freshness: opts.timeRange ? TIME_TO_BRAVE_FRESHNESS[opts.timeRange] : undefined,
+      includeDomains: opts.includeDomains,
     });
 
   const ddgAction: Action<NormalizedResult[]> = (provider) =>
@@ -66,6 +75,7 @@ export async function run(query: string, opts: SearchOptions = {}): Promise<Reco
         max_results: max,
         time_range: opts.timeRange ?? null,
         country: opts.country ?? null,
+        include_domains: opts.includeDomains ?? null,
         corroborate: corroborate || null,
       };
 
@@ -95,13 +105,14 @@ export async function run(query: string, opts: SearchOptions = {}): Promise<Reco
 
       // --- Corroborate (parallel fan-out) path ---
       if (corroborate) {
-        const { result, active, participants, failures } = await runChainParallel(
+        const { result, active, participants, failures, rejected } = await runChainParallel(
           chain,
           { tavily: tavilyAction, brave: braveAction, duckduckgo: ddgAction },
           { count: corroborate },
         );
         receipt.fallback_chain = failures;
         receipt.cache_hit = false;
+        if (rejected.length > 0) receipt.rejected = rejected;
         if (active === null) {
           receipt.status = "error";
           return await chainFailedPayload("search", failures);
