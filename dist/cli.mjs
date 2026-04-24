@@ -3528,9 +3528,9 @@ function walkRedact(value) {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
       if (k === "url" || k === "source_url" || k === "next_url") {
-        out[k] = typeof v === "string" ? redactUrl(v) : v;
-      } else if (k === "urls" || k === "selected_urls") {
-        out[k] = Array.isArray(v) ? v.map((u) => typeof u === "string" ? redactUrl(u) : u) : v;
+        out[k] = typeof v === "string" ? redactUrl(v) : walkRedact(v);
+      } else if (k === "urls" || k === "selected_urls" || k === "verified_urls") {
+        out[k] = Array.isArray(v) ? v.map((u) => typeof u === "string" ? redactUrl(u) : walkRedact(u)) : walkRedact(v);
       } else {
         out[k] = walkRedact(v);
       }
@@ -6535,6 +6535,7 @@ async function run3(library, opts = {}) {
 }
 
 // src/ops/fetch.ts
+import { createHash as createHash3, randomUUID as randomUUID2 } from "node:crypto";
 var TAG_RE2 = /<[^>]+>/g;
 var WS_RE = /\n{3,}/g;
 var ENTITY_MAP2 = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " " };
@@ -6566,7 +6567,12 @@ async function run4(url, opts = {}) {
     params: { formats: opts.formats ?? null, screenshot: !!opts.screenshot }
   });
   const firecrawlAction = (provider) => provider.scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
-  return await withCall("fetch", { provider: "firecrawl", correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
+  return await withCall("fetch", {
+    provider: "firecrawl",
+    correlationId: opts.correlationId,
+    noReceipt: opts.noReceipt,
+    parentCallId: opts.parentCallId ?? null
+  }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(url));
     receipt.params = { formats: opts.formats ?? null, screenshot: !!opts.screenshot };
     const cached = await get(cKey, CACHE_TTL_SEC.fetch, { noCache: opts.noCache });
@@ -6655,6 +6661,113 @@ async function run4(url, opts = {}) {
       returncode: 0
     };
   });
+}
+async function runMany(urls, opts = {}) {
+  const opName = opts.op ?? "batch_fetch";
+  if (urls.length === 0) {
+    return {
+      ok: false,
+      operation: opName,
+      error: "no URLs provided",
+      returncode: 2
+    };
+  }
+  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 4, 16));
+  const parentCallId = opts.parentCallId ?? randomUUID2();
+  const started = Date.now();
+  const entries = new Array(urls.length);
+  let okCount = 0;
+  let degradedCount = 0;
+  let errorCount = 0;
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= urls.length)
+        return;
+      const url = urls[i];
+      const childStart = Date.now();
+      try {
+        const childResult = await run4(url, {
+          formats: opts.formats,
+          screenshot: opts.screenshot,
+          correlationId: opts.correlationId,
+          noReceipt: opts.noReceipt,
+          noCache: opts.noCache,
+          parentCallId
+        });
+        const ok = childResult.ok === true;
+        const page = childResult.page;
+        const md = page?.markdown ?? "";
+        const sha = md ? createHash3("sha256").update(md, "utf8").digest("hex") : null;
+        const status = childResult.status ?? (ok ? "ok" : "error");
+        if (status === "ok")
+          okCount += 1;
+        else if (status === "degraded")
+          degradedCount += 1;
+        else
+          errorCount += 1;
+        entries[i] = {
+          url,
+          sha256: sha,
+          status,
+          provider: childResult.provider ?? null,
+          duration_ms: Date.now() - childStart,
+          title: page?.title ?? undefined,
+          bytes: md ? md.length : undefined,
+          error: ok ? undefined : childResult.error ?? undefined
+        };
+      } catch (err) {
+        errorCount += 1;
+        entries[i] = {
+          url,
+          sha256: null,
+          status: "error",
+          provider: null,
+          duration_ms: Date.now() - childStart,
+          error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 200) : String(err).slice(0, 200)
+        };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
+  const overallStatus = errorCount === urls.length ? "error" : degradedCount + errorCount > 0 ? "degraded" : "ok";
+  const batchReceipt = {
+    ts: utcIso(),
+    call_id: parentCallId,
+    parent_call_id: null,
+    correlation_id: opts.correlationId ?? process.env.WSC_CORRELATION_ID ?? null,
+    op: opName,
+    provider: null,
+    selected_urls: urls,
+    results_count: urls.length,
+    selected_count: urls.length,
+    urls: entries.map((e) => ({
+      url: e.url,
+      sha256: e.sha256 ?? undefined,
+      status: e.status,
+      provider: e.provider ?? undefined,
+      duration_ms: e.duration_ms
+    })),
+    duration_ms: Date.now() - started,
+    started_at: utcIso(started),
+    status: overallStatus
+  };
+  if (!opts.noReceipt) {
+    try {
+      await record(batchReceipt);
+    } catch {}
+  }
+  return {
+    ok: errorCount < urls.length,
+    operation: opName,
+    parent_call_id: parentCallId,
+    urls: entries,
+    counts: { ok: okCount, degraded: degradedCount, error: errorCount, total: urls.length },
+    duration_ms: Date.now() - started,
+    status: overallStatus,
+    returncode: errorCount === urls.length ? 2 : 0
+  };
 }
 
 // src/routing.ts
@@ -7082,6 +7195,66 @@ async function run6(query, opts = {}) {
   };
 }
 
+// src/ops/verify.ts
+async function run7(urls, opts = {}) {
+  let targetUrls = urls;
+  if (opts.fromReceipt) {
+    const events = (await tail({ lines: 1000 })).events;
+    const ev = events.find((e) => e.call_id === opts.fromReceipt);
+    if (!ev) {
+      return {
+        ok: false,
+        operation: "verify",
+        error: `no audit event with call_id=${opts.fromReceipt} (within last 1000 receipts)`,
+        returncode: 2
+      };
+    }
+    const fromUrls = ev.selected_urls ?? [];
+    if (fromUrls.length === 0) {
+      return {
+        ok: false,
+        operation: "verify",
+        error: `receipt ${opts.fromReceipt} has no selected_urls to verify`,
+        returncode: 2
+      };
+    }
+    targetUrls = fromUrls;
+  }
+  if (targetUrls.length === 0) {
+    return { ok: false, operation: "verify", error: "no URLs to verify (pass URLs or --from-receipt)", returncode: 2 };
+  }
+  const result = await runMany(targetUrls, {
+    op: "verify",
+    concurrency: opts.concurrency,
+    correlationId: opts.correlationId,
+    noReceipt: opts.noReceipt,
+    noCache: opts.noCache
+  });
+  const entries = result.urls ?? [];
+  const verified = entries.map((e) => ({
+    url: e.url,
+    sha256: e.sha256 ?? null,
+    fetched_at: new Date().toISOString(),
+    status: e.status ?? "error",
+    provider: e.provider ?? null,
+    title: e.title ?? null,
+    bytes: e.bytes ?? null,
+    duration_ms: e.duration_ms ?? null,
+    error: e.error ?? null
+  }));
+  return {
+    ok: result.ok,
+    operation: "verify",
+    parent_call_id: result.parent_call_id,
+    urls: verified,
+    counts: result.counts,
+    duration_ms: result.duration_ms,
+    status: result.status,
+    returncode: result.returncode,
+    ...opts.fromReceipt ? { from_receipt: opts.fromReceipt } : {}
+  };
+}
+
 // src/cli.ts
 var VERSION = "0.2.0";
 function resolveJson(opts) {
@@ -7379,11 +7552,32 @@ program2.command("discover <query>").description("semantic discovery via Exa").a
   });
   emit(globals, result);
 });
-program2.command("fetch <url>").description("clean a known URL via Firecrawl").option("--format <fmt>", "markdown|html (repeatable)", (val, prev = []) => [...prev, val], []).option("--screenshot").action(async (url, opts) => {
+program2.command("fetch <url> [moreUrls...]").description("clean a known URL via Firecrawl; pass multiple URLs for concurrent batch_fetch").option("--format <fmt>", "markdown|html (repeatable)", (val, prev = []) => [...prev, val], []).option("--screenshot").option("--concurrency <n>", "max in-flight fetches in batch mode (default 4)", (v) => Number.parseInt(v, 10)).action(async (url, moreUrls, opts) => {
   const globals = getGlobals();
+  const all = [url, ...moreUrls ?? []];
+  if (all.length > 1) {
+    const result2 = await runMany(all, {
+      formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
+      screenshot: !!opts.screenshot,
+      concurrency: opts.concurrency,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache
+    });
+    emit(globals, result2);
+  }
   const result = await run4(url, {
     formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
     screenshot: !!opts.screenshot,
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
+  });
+  emit(globals, result);
+});
+program2.command("verify [urls...]").description("fetch URLs and emit sha256-stamped proof receipts (use before citing in writeups)").option("--from-receipt <call_id>", "verify the selected_urls of a prior receipt").option("--concurrency <n>", "max in-flight fetches (default 4)", (v) => Number.parseInt(v, 10)).action(async (urls, opts) => {
+  const globals = getGlobals();
+  const result = await run7(urls ?? [], {
+    fromReceipt: opts.fromReceipt,
+    concurrency: opts.concurrency,
     noReceipt: globals.noReceipt,
     noCache: globals.noCache
   });

@@ -68,6 +68,10 @@ export interface Receipt {
   duration_ms?: number;
   cache_hit?: boolean;
   multi_source_evidence?: Array<{ provider: string; score?: number }>;
+  /** URLs verified (fetched + sha256'd) as part of this op (M2 of v0.3). */
+  verified_urls?: Array<{ url: string; sha256: string; fetched_at: string; status: "ok" | "degraded" | "error"; error?: string }>;
+  /** Per-URL detail for batch_fetch / verify ops (M2 of v0.3). */
+  urls?: Array<{ url: string; sha256?: string; status?: string; duration_ms?: number; provider?: string; error?: string }>;
   status?: "ok" | "degraded" | "error";
   error?: string;
   started_at?: string;
@@ -83,9 +87,13 @@ function walkRedact(value: unknown): unknown {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (k === "url" || k === "source_url" || k === "next_url") {
-        out[k] = typeof v === "string" ? redactUrl(v) : v;
-      } else if (k === "urls" || k === "selected_urls") {
-        out[k] = Array.isArray(v) ? v.map((u) => (typeof u === "string" ? redactUrl(u) : u)) : v;
+        out[k] = typeof v === "string" ? redactUrl(v) : walkRedact(v);
+      } else if (k === "urls" || k === "selected_urls" || k === "verified_urls") {
+        // Element may be a bare URL string OR an object whose .url field needs
+        // recursive redaction.
+        out[k] = Array.isArray(v)
+          ? v.map((u) => (typeof u === "string" ? redactUrl(u) : walkRedact(u)))
+          : walkRedact(v);
       } else {
         out[k] = walkRedact(v);
       }

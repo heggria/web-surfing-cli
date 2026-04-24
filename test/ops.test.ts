@@ -11,6 +11,7 @@ import * as discoverOp from "../src/ops/discover.js";
 import * as fetchOp from "../src/ops/fetch.js";
 import * as planOp from "../src/ops/plan.js";
 import * as searchOp from "../src/ops/search.js";
+import * as verifyOp from "../src/ops/verify.js";
 
 function withFakeFetch<T>(handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>, fn: () => Promise<T>): Promise<T> {
   const orig = globalThis.fetch;
@@ -344,5 +345,130 @@ describe("search.run with --corroborate (parallel fan-out)", () => {
     expect(out.status).toBe("degraded");
     const evidence = out.multi_source_evidence as Array<unknown>;
     expect(evidence.length).toBe(1);
+  });
+});
+
+// --- batch fetch + verify (M2) -------------------------------------------
+
+describe("fetch.runMany (batch)", () => {
+  test("fetches multiple URLs concurrently and produces sha256 per URL", async () => {
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      // Decode the URL parameter from Firecrawl request body — but our fake
+      // doesn't parse body; just respond with deterministic markdown per URL.
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: `# fake page ${Math.random()}`, metadata: { title: "T", sourceURL: "https://x.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () =>
+      fetchOp.runMany(["https://a.com", "https://b.com", "https://c.com"], { concurrency: 4 }),
+    );
+    expect(out.ok).toBe(true);
+    expect(out.operation).toBe("batch_fetch");
+    const urls = out.urls as Array<{ url: string; sha256: string | null; status: string }>;
+    expect(urls.length).toBe(3);
+    expect(urls.every((u) => typeof u.sha256 === "string" && u.sha256.length === 64)).toBe(true);
+    const counts = out.counts as Record<string, number>;
+    expect(counts.total).toBe(3);
+  });
+
+  test("writes a parent batch_fetch receipt with urls[] details", async () => {
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "body", metadata: { title: "T", sourceURL: "https://x.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    await withFakeFetch(handler, () => fetchOp.runMany(["https://a.com", "https://b.com"]));
+    const events = (await audit.tail({ lines: 50 })).events;
+    const batch = events.filter((e) => e.op === "batch_fetch");
+    expect(batch.length).toBeGreaterThan(0);
+    const last = batch[batch.length - 1]!;
+    const lastUrls = last.urls as Array<{ url: string; sha256?: string }>;
+    expect(lastUrls.length).toBe(2);
+    expect(lastUrls.every((u) => typeof u.sha256 === "string")).toBe(true);
+    // Children: 2 fetch receipts whose parent_call_id points to the batch.
+    const children = events.filter((e) => e.op === "fetch" && e.parent_call_id === last.call_id);
+    expect(children.length).toBe(2);
+  });
+});
+
+describe("verify.run", () => {
+  test("verifies positional URLs and returns sha256 + fetched_at", async () => {
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "page body", metadata: { title: "Title", sourceURL: "https://example.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    const out = await withFakeFetch(handler, () => verifyOp.run(["https://example.com/a", "https://example.com/b"]));
+    expect(out.ok).toBe(true);
+    expect(out.operation).toBe("verify");
+    const urls = out.urls as Array<{ url: string; sha256: string; fetched_at: string; status: string }>;
+    expect(urls.length).toBe(2);
+    expect(urls.every((u) => typeof u.sha256 === "string" && u.sha256.length === 64)).toBe(true);
+    expect(urls.every((u) => typeof u.fetched_at === "string")).toBe(true);
+    // Receipt has op=verify (not batch_fetch).
+    const events = (await audit.tail({ lines: 10 })).events;
+    const verifyEvents = events.filter((e) => e.op === "verify");
+    expect(verifyEvents.length).toBeGreaterThan(0);
+  });
+
+  test("--from-receipt loads selected_urls from a prior call", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    process.env.FIRECRAWL_API_KEY = "fc_test";
+    const handler = (url: string) => {
+      if (url.includes("tavily.com")) {
+        return jsonResponse({
+          results: [
+            { url: "https://prior.com/x", title: "X", content: "..." },
+            { url: "https://prior.com/y", title: "Y", content: "..." },
+          ],
+        });
+      }
+      if (url.includes("api.firecrawl.dev")) {
+        return jsonResponse({
+          success: true,
+          data: { markdown: "body", metadata: { title: "T", sourceURL: "https://prior.com" } },
+        });
+      }
+      return jsonResponse({});
+    };
+    const searchResult = await withFakeFetch(handler, () => searchOp.run("from-receipt-test"));
+    const events = (await audit.tail({ lines: 10 })).events;
+    const searchEvent = events.filter((e) => e.op === "search").pop();
+    expect(searchEvent).toBeDefined();
+    const callId = searchEvent!.call_id;
+    void searchResult;
+    const verifyResult = await withFakeFetch(handler, () => verifyOp.run([], { fromReceipt: callId }));
+    expect(verifyResult.ok).toBe(true);
+    const urls = verifyResult.urls as Array<{ url: string; sha256: string }>;
+    expect(urls.length).toBe(2);
+    expect(urls[0]!.url).toBe("https://prior.com/x");
+  });
+
+  test("missing --from-receipt or URLs yields error", async () => {
+    const out = await verifyOp.run([]);
+    expect(out.ok).toBe(false);
+    expect(out.returncode).toBe(2);
+  });
+
+  test("--from-receipt with unknown call_id yields error", async () => {
+    const out = await verifyOp.run([], { fromReceipt: "nope-not-real" });
+    expect(out.ok).toBe(false);
+    expect(out.returncode).toBe(2);
+    expect(String(out.error)).toContain("nope-not-real");
   });
 });

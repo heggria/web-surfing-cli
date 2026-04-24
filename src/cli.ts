@@ -16,6 +16,7 @@ import * as docs from "./ops/docs.js";
 import * as fetchOp from "./ops/fetch.js";
 import * as plan from "./ops/plan.js";
 import * as search from "./ops/search.js";
+import * as verify from "./ops/verify.js";
 
 const VERSION = "0.2.0";
 
@@ -399,17 +400,46 @@ program
     emit(globals, result);
   });
 
-// fetch
+// fetch (single URL) + batch (multiple URLs)
 program
-  .command("fetch <url>")
-  .description("clean a known URL via Firecrawl")
+  .command("fetch <url> [moreUrls...]")
+  .description("clean a known URL via Firecrawl; pass multiple URLs for concurrent batch_fetch")
   .option("--format <fmt>", "markdown|html (repeatable)", (val: string, prev: string[] = []) => [...prev, val], [] as string[])
   .option("--screenshot")
-  .action(async (url, opts) => {
+  .option("--concurrency <n>", "max in-flight fetches in batch mode (default 4)", (v) => Number.parseInt(v, 10))
+  .action(async (url, moreUrls, opts) => {
     const globals = getGlobals();
+    const all = [url, ...((moreUrls as string[] | undefined) ?? [])];
+    if (all.length > 1) {
+      const result = await fetchOp.runMany(all, {
+        formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
+        screenshot: !!opts.screenshot,
+        concurrency: opts.concurrency,
+        noReceipt: globals.noReceipt,
+        noCache: globals.noCache,
+      });
+      emit(globals, result);
+    }
     const result = await fetchOp.run(url, {
       formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
       screenshot: !!opts.screenshot,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
+    });
+    emit(globals, result);
+  });
+
+// verify
+program
+  .command("verify [urls...]")
+  .description("fetch URLs and emit sha256-stamped proof receipts (use before citing in writeups)")
+  .option("--from-receipt <call_id>", "verify the selected_urls of a prior receipt")
+  .option("--concurrency <n>", "max in-flight fetches (default 4)", (v) => Number.parseInt(v, 10))
+  .action(async (urls, opts) => {
+    const globals = getGlobals();
+    const result = await verify.run(urls ?? [], {
+      fromReceipt: opts.fromReceipt,
+      concurrency: opts.concurrency,
       noReceipt: globals.noReceipt,
       noCache: globals.noCache,
     });

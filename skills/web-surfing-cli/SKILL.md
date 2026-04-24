@@ -26,8 +26,10 @@ If installed via npm, you can also invoke it by absolute path: `~/.npm-global/bi
 | Official docs of a library / framework / API  | `wsc docs`        | Context7         | Firecrawl GitHub README → urllib raw README     |
 | Find similar projects / papers / companies / people | `wsc discover` | Exa              | Tavily (re-prompted) → Brave → DuckDuckGo HTML  |
 | Current web facts / news / pricing / release notes  | `wsc search`   | Tavily           | Brave → DuckDuckGo HTML                         |
-| Clean a known URL into markdown               | `wsc fetch`       | Firecrawl        | stdlib urllib + html.parser (degraded)          |
+| Clean a known URL into markdown               | `wsc fetch <url>` | Firecrawl        | stdlib urllib + html.parser (degraded)          |
+| Clean MULTIPLE URLs in parallel               | `wsc fetch URL1 URL2 ...` | Firecrawl | same chain per URL; concurrent (default 4)      |
 | Crawl a site or section                       | `wsc crawl`       | Firecrawl        | (no fallback — fail loud)                       |
+| Verify URLs before citing in a writeup        | `wsc verify`      | (uses fetch chain) | sha256 + fetched_at proof per URL; supports `--from-receipt` |
 | Not sure which lane → ask wsc to route        | `wsc plan <q>`    | (rule router)    | dispatches to one of the above                  |
 
 When uncertain, run `wsc plan "<query>" --explain` first — it prints the routing decision and the candidate `would_run` command without spending API credits.
@@ -67,6 +69,26 @@ wsc receipts tail --lines 20 --json
 wsc receipts summary --days 7 --by-domain --cost
 wsc receipts tail --tool fetch --since 1h
 ```
+
+## Citation Discipline (v0.3)
+
+**The single rule:** A URL returned by `wsc search` or `wsc discover` is a **provider snippet**, not a fetched page. Do NOT cite it directly in a writeup.
+
+To cite a URL in a report, summary, or analysis you must have actually fetched it. There are three ways to do that, in order of preference:
+
+1. **`wsc deepdive <topic>`** (M3) — fully orchestrated; emits `<evidence url="..." sha256="..." fetched_at="..." />` blocks ready to paste into the writeup.
+2. **`wsc verify URL1 URL2 ...`** (M2) — explicit cite-check; produces compact `{url, sha256, fetched_at, status}` receipts. Use after a search when you've picked which URLs to quote.
+3. **`wsc verify --from-receipt <call_id>`** — verifies *every* selected_url of a prior search/discover. Use when the user asked for thoroughness and you want all the source pages on the record.
+
+For batch reads where you actually need the page bodies (not just proof), `wsc fetch URL1 URL2 URL3` runs the same fetch pipeline concurrently and gives you `markdown` per URL.
+
+What "verified" means in receipts:
+- `urls[i].sha256` is computed from the markdown body. Same content → same sha. Quote `(sha256: abc12345...)` in the writeup so the reader can spot-check later.
+- `urls[i].status: "ok"` → Firecrawl-quality extraction. Quote freely.
+- `urls[i].status: "degraded"` → fell back to stdlib urllib (no JS render, no PDF). Cite with the caveat.
+- `urls[i].status: "error"` → unreachable. Do NOT cite.
+
+What this prevents: a `wsc search` snippet may quote text from a page section that isn't actually relevant, or even text that the search engine reconstructed from its index but doesn't appear verbatim. The `verify` step catches both — if the page body's sha doesn't include the quoted text, you fabricated.
 
 ## Cross-validation & Confidence (v0.3)
 
