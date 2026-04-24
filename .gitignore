@@ -3,7 +3,7 @@
 
 # Node / Bun
 node_modules/
-dist/
+dist/*
 !dist/cli.mjs
 *.tgz
 *.log
