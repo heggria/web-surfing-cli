@@ -1,8 +1,9 @@
 /** wsc discover — Exa primary, Tavily/Brave/DDG fallbacks. */
 
 import { withCall } from "../audit.js";
+import * as cache from "../cache.js";
 import { chainFailedPayload, filteredChain, queryFingerprint, runChain } from "./_chain.js";
-import type { Action } from "./_chain.js";
+import type { Action, FallbackStep } from "./_chain.js";
 import {
   BraveProvider,
   DuckDuckGoProvider,
@@ -24,6 +25,14 @@ export interface DiscoverOptions {
   numResults?: number;
   correlationId?: string;
   noReceipt?: boolean;
+  noCache?: boolean;
+}
+
+interface DiscoverCacheValue {
+  provider: string;
+  results: Record<string, unknown>[];
+  fallback_chain: FallbackStep[];
+  cached_status: "ok" | "degraded";
 }
 
 export async function run(query: string, opts: DiscoverOptions = {}): Promise<Record<string, unknown>> {
@@ -31,6 +40,11 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
   const category = opts.type ? TYPE_TO_EXA_CATEGORY[opts.type] : undefined;
   const framed = reframeForKeywordSearch(query, opts.type);
   const num = opts.numResults ?? 10;
+  const cKey = cache.cacheKey({
+    op: "discover",
+    query,
+    params: { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num },
+  });
 
   const exaAction: Action<NormalizedResult[]> = (provider) =>
     (provider as ExaProvider).search(query, {
@@ -55,6 +69,29 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
     async (receipt) => {
       Object.assign(receipt, queryFingerprint(query));
       receipt.params = { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num };
+
+      const cached = await cache.get<DiscoverCacheValue>(cKey, cache.CACHE_TTL_SEC.discover!, { noCache: opts.noCache });
+      if (cached) {
+        receipt.cache_hit = true;
+        receipt.provider = cached.provider;
+        receipt.fallback_chain = cached.fallback_chain;
+        receipt.selected_urls = cached.results.map((r) => String((r as Record<string, unknown>).url ?? ""));
+        receipt.results_count = cached.results.length;
+        receipt.selected_count = cached.results.length;
+        if (cached.cached_status === "degraded") receipt.status = "degraded";
+        return {
+          ok: true,
+          operation: "discover",
+          provider: cached.provider,
+          query,
+          results: cached.results,
+          fallback_chain: cached.fallback_chain,
+          status: cached.cached_status,
+          cache_hit: true,
+          returncode: 0,
+        };
+      }
+
       const { active, result, fallback } = await runChain(chain, {
         exa: exaAction,
         tavily: tavilyAction,
@@ -62,6 +99,7 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
         duckduckgo: ddgAction,
       });
       receipt.fallback_chain = fallback;
+      receipt.cache_hit = false;
       if (active === null || result === null) {
         receipt.status = "error";
         return await chainFailedPayload("discover", fallback);
@@ -71,15 +109,23 @@ export async function run(query: string, opts: DiscoverOptions = {}): Promise<Re
       receipt.selected_urls = urls;
       receipt.results_count = result.length;
       receipt.selected_count = result.length;
-      if (active !== chain[0]) receipt.status = "degraded";
+      const status: "ok" | "degraded" = active !== chain[0] ? "degraded" : "ok";
+      if (status === "degraded") receipt.status = "degraded";
+      const resultsJson = result.map((r) => r.toJSON());
+      await cache.set<DiscoverCacheValue>(
+        cKey,
+        { provider: active, results: resultsJson, fallback_chain: fallback, cached_status: status },
+        { ttlSec: cache.CACHE_TTL_SEC.discover!, op: "discover", provider: active, noCache: opts.noCache },
+      );
       return {
         ok: true,
         operation: "discover",
         provider: active,
         query,
-        results: result.map((r) => r.toJSON()),
+        results: resultsJson,
         fallback_chain: fallback,
-        status: active !== chain[0] ? "degraded" : "ok",
+        status,
+        cache_hit: false,
         returncode: 0,
       };
     },

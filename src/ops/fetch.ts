@@ -1,8 +1,9 @@
 /** wsc fetch — Firecrawl primary, native fetch+regex stdlib fallback (degraded). */
 
 import { withCall } from "../audit.js";
+import * as cache from "../cache.js";
 import { filteredChain, queryFingerprint, runChain } from "./_chain.js";
-import type { Action } from "./_chain.js";
+import type { Action, FallbackStep } from "./_chain.js";
 import { FetchedPage, FirecrawlProvider, httpRequest } from "../providers/index.js";
 import { normalizeUrl } from "../_url.js";
 
@@ -11,6 +12,14 @@ export interface FetchOptions {
   screenshot?: boolean;
   correlationId?: string;
   noReceipt?: boolean;
+  noCache?: boolean;
+}
+
+interface FetchCacheValue {
+  provider: string;
+  page: ReturnType<FetchedPage["toJSON"]>;
+  fallback_chain: FallbackStep[];
+  cached_status: "ok" | "degraded";
 }
 
 const TAG_RE = /<[^>]+>/g;
@@ -42,6 +51,11 @@ async function stdlibFetch(url: string): Promise<FetchedPage> {
 
 export async function run(url: string, opts: FetchOptions = {}): Promise<Record<string, unknown>> {
   const chain = filteredChain("url_fetch");
+  const cKey = cache.cacheKey({
+    op: "fetch",
+    query: url,
+    params: { formats: opts.formats ?? null, screenshot: !!opts.screenshot },
+  });
   const firecrawlAction: Action<FetchedPage> = (provider) =>
     (provider as FirecrawlProvider).scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
 
@@ -51,13 +65,37 @@ export async function run(url: string, opts: FetchOptions = {}): Promise<Record<
     async (receipt) => {
       Object.assign(receipt, queryFingerprint(url));
       receipt.params = { formats: opts.formats ?? null, screenshot: !!opts.screenshot };
+
+      const cached = await cache.get<FetchCacheValue>(cKey, cache.CACHE_TTL_SEC.fetch!, { noCache: opts.noCache });
+      if (cached) {
+        receipt.cache_hit = true;
+        receipt.provider = cached.provider;
+        receipt.fallback_chain = cached.fallback_chain;
+        const cachedUrl = (cached.page as Record<string, unknown>).url;
+        receipt.selected_urls = typeof cachedUrl === "string" ? [cachedUrl] : [];
+        receipt.selected_count = receipt.selected_urls.length;
+        receipt.results_count = receipt.selected_urls.length;
+        if (cached.cached_status === "degraded") receipt.status = "degraded";
+        return {
+          ok: true,
+          operation: "fetch",
+          provider: cached.provider,
+          page: cached.page,
+          fallback_chain: cached.fallback_chain,
+          status: cached.cached_status,
+          cache_hit: true,
+          returncode: 0,
+        };
+      }
+
       const { active, result, fallback } = await runChain(chain, { firecrawl: firecrawlAction });
       receipt.fallback_chain = [...fallback];
+      receipt.cache_hit = false;
 
       if (active === null || result === null) {
         try {
           const page = await stdlibFetch(url);
-          (receipt.fallback_chain as Array<{ from: string; to?: string; reason: string }>).push({
+          (receipt.fallback_chain as FallbackStep[]).push({
             from: "firecrawl",
             to: "urllib",
             reason: "all_providers_failed",
@@ -67,19 +105,26 @@ export async function run(url: string, opts: FetchOptions = {}): Promise<Record<
           receipt.selected_urls = [page.url];
           receipt.selected_count = 1;
           receipt.results_count = 1;
+          const pageJson = page.toJSON();
+          await cache.set<FetchCacheValue>(
+            cKey,
+            { provider: "urllib", page: pageJson, fallback_chain: receipt.fallback_chain as FallbackStep[], cached_status: "degraded" },
+            { ttlSec: cache.CACHE_TTL_SEC.fetch!, op: "fetch", provider: "urllib", noCache: opts.noCache },
+          );
           return {
             ok: true,
             operation: "fetch",
             provider: "urllib",
-            page: page.toJSON(),
+            page: pageJson,
             fallback_chain: receipt.fallback_chain,
             status: "degraded",
+            cache_hit: false,
             returncode: 0,
           };
         } catch (err) {
           receipt.status = "error";
           receipt.error = (err instanceof Error ? err.message : String(err)).slice(0, 200);
-          (receipt.fallback_chain as Array<{ from: string; reason: string; error?: string }>).push({
+          (receipt.fallback_chain as FallbackStep[]).push({
             from: "urllib",
             reason: "transport_error",
             error: (err instanceof Error ? err.message : String(err)).slice(0, 200),
@@ -99,13 +144,21 @@ export async function run(url: string, opts: FetchOptions = {}): Promise<Record<
       receipt.selected_urls = result.url ? [result.url] : [];
       receipt.selected_count = 1;
       receipt.results_count = 1;
+      const pageJson = result.toJSON();
+      const status = result.status;
+      await cache.set<FetchCacheValue>(
+        cKey,
+        { provider: active, page: pageJson, fallback_chain: fallback, cached_status: status === "degraded" ? "degraded" : "ok" },
+        { ttlSec: cache.CACHE_TTL_SEC.fetch!, op: "fetch", provider: active, noCache: opts.noCache },
+      );
       return {
         ok: true,
         operation: "fetch",
         provider: active,
-        page: result.toJSON(),
+        page: pageJson,
         fallback_chain: receipt.fallback_chain,
         status: result.status,
+        cache_hit: false,
         returncode: 0,
       };
     },

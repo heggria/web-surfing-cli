@@ -8,6 +8,7 @@
 
 import { Command, Option } from "commander";
 import * as audit from "./audit.js";
+import * as cache from "./cache.js";
 import * as config from "./config.js";
 import * as crawl from "./ops/crawl.js";
 import * as discover from "./ops/discover.js";
@@ -22,6 +23,7 @@ interface GlobalOptions {
   json?: boolean;
   quiet?: boolean;
   noReceipt?: boolean;
+  noCache?: boolean;
   budget?: number;
 }
 
@@ -85,6 +87,15 @@ function renderHuman(payload: Record<string, unknown>): void {
     renderPlanExplain(payload);
     return;
   }
+  if (op === "cache.stats") {
+    renderCacheStats(payload);
+    return;
+  }
+  if (op === "cache.clear") {
+    if (payload.error) process.stderr.write(`${payload.error}\n`);
+    else console.log(`removed ${payload.removed_count ?? 0} entries (${payload.size_human ?? "0 B"})`);
+    return;
+  }
   process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
 }
 
@@ -138,6 +149,27 @@ function renderReceiptsSummary(payload: Record<string, unknown>): void {
   if (high.length > 0) console.log(`  high-confidence events: ${high.length}`);
 }
 
+function renderCacheStats(payload: Record<string, unknown>): void {
+  console.log(`cache  count=${payload.count ?? 0}  size=${payload.size_human ?? "0 B"}  expired=${payload.expired_count ?? 0}`);
+  const oldest = payload.oldest as string | null | undefined;
+  const newest = payload.newest as string | null | undefined;
+  if (oldest) console.log(`  oldest: ${oldest}`);
+  if (newest) console.log(`  newest: ${newest}`);
+  for (const [label, key] of [
+    ["by op", "by_op"],
+    ["by provider", "by_provider"],
+  ] as const) {
+    const d = (payload[key] as Record<string, number> | undefined) ?? {};
+    if (Object.keys(d).length > 0) {
+      console.log(`  ${label}:`);
+      for (const [k, v] of Object.entries(d).sort(([, a], [, b]) => b - a)) {
+        console.log(`    ${String(v).padStart(5)}  ${k}`);
+      }
+    }
+  }
+  console.log(`  path: ${payload.path ?? ""}`);
+}
+
 function renderPlanExplain(payload: Record<string, unknown>): void {
   const d = (payload.decision as Record<string, unknown> | undefined) ?? {};
   console.log(`query: ${JSON.stringify(payload.query)}`);
@@ -171,10 +203,20 @@ program
   .option("--json", "emit machine-readable JSON (auto-on when stdout is not a TTY or WSC_JSON=1)")
   .option("--quiet", "suppress human-mode chatter")
   .option("--no-receipt", "skip audit log write")
+  .option("--no-cache", "skip cache read/write (also: WSC_NO_CACHE=1)")
   .option("--budget <n>", "override per-task search budget", (v) => Number.parseInt(v, 10));
 
 function getGlobals(): GlobalOptions {
-  return program.opts() as GlobalOptions;
+  // Commander's `--no-foo` flags set `opts.foo = false` (not `opts.noFoo`).
+  // Translate back to the `noXxx` keys used throughout the rest of the code.
+  const raw = program.opts() as Record<string, unknown>;
+  return {
+    json: raw.json as boolean | undefined,
+    quiet: raw.quiet as boolean | undefined,
+    noReceipt: raw.receipt === false,
+    noCache: raw.cache === false,
+    budget: raw.budget as number | undefined,
+  };
 }
 
 // init
@@ -258,6 +300,44 @@ rec
     emit(getGlobals(), result as unknown as Record<string, unknown>);
   });
 
+// cache
+const ca = program.command("cache").description("content-addressed response cache");
+ca
+  .command("stats")
+  .description("show cache size, count, per-op breakdown, expired entries")
+  .action(() => {
+    emit(getGlobals(), cache.stats() as unknown as Record<string, unknown>);
+  });
+ca
+  .command("clear")
+  .description("remove cached entries (refuses without --all or a filter)")
+  .option("--all", "remove every cached entry (still respects --op / --provider filters)")
+  .option("--older-than <duration>", "remove entries cached more than this ago (e.g. 5m, 2h, 1d)")
+  .option("--expired-only", "remove only entries past their TTL")
+  .option("--op <name>", "filter by op (search|discover|fetch|docs)")
+  .option("--provider <name>", "filter by provider (tavily|brave|exa|firecrawl|context7|urllib)")
+  .action((opts) => {
+    let olderThanSec: number | undefined;
+    try {
+      if (opts.olderThan) olderThanSec = cache.parseDurationSec(opts.olderThan);
+    } catch (err) {
+      emit(getGlobals(), {
+        ok: false,
+        operation: "cache.clear",
+        error: err instanceof Error ? err.message : String(err),
+        returncode: 2,
+      });
+    }
+    const result = cache.clear({
+      all: !!opts.all,
+      olderThanSec,
+      expiredOnly: !!opts.expiredOnly,
+      op: opts.op,
+      provider: opts.provider,
+    });
+    emit(getGlobals(), result as unknown as Record<string, unknown>);
+  });
+
 // plan
 program
   .command("plan <query>")
@@ -286,12 +366,14 @@ program
   .option("--topic <topic>")
   .option("--version <ver>")
   .action(async (library, opts) => {
+    const globals = getGlobals();
     const result = await docs.run(library, {
       topic: opts.topic,
       version: opts.version,
-      noReceipt: getGlobals().noReceipt,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
     });
-    emit(getGlobals(), result as unknown as Record<string, unknown>);
+    emit(globals, result as unknown as Record<string, unknown>);
   });
 
 // discover
@@ -302,13 +384,15 @@ program
   .option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10))
   .option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10)
   .action(async (query, opts) => {
+    const globals = getGlobals();
     const result = await discover.run(query, {
       type: opts.type,
       sinceDays: opts.since,
       numResults: opts.numResults,
-      noReceipt: getGlobals().noReceipt,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
     });
-    emit(getGlobals(), result);
+    emit(globals, result);
   });
 
 // fetch
@@ -318,12 +402,14 @@ program
   .option("--format <fmt>", "markdown|html (repeatable)", (val: string, prev: string[] = []) => [...prev, val], [] as string[])
   .option("--screenshot")
   .action(async (url, opts) => {
+    const globals = getGlobals();
     const result = await fetchOp.run(url, {
       formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
       screenshot: !!opts.screenshot,
-      noReceipt: getGlobals().noReceipt,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
     });
-    emit(getGlobals(), result);
+    emit(globals, result);
   });
 
 // crawl
@@ -357,13 +443,15 @@ program
   .addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"]))
   .option("--country <code>")
   .action(async (query, opts) => {
+    const globals = getGlobals();
     const result = await search.run(query, {
       maxResults: opts.maxResults,
       timeRange: opts.time,
       country: opts.country,
-      noReceipt: getGlobals().noReceipt,
+      noReceipt: globals.noReceipt,
+      noCache: globals.noCache,
     });
-    emit(getGlobals(), result);
+    emit(globals, result);
   });
 
 program.parseAsync().catch((err: unknown) => {

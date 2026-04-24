@@ -3764,6 +3764,19 @@ function round4(n) {
   return Math.round(n * 1e4) / 1e4;
 }
 
+// src/cache.ts
+import { createHash as createHash2 } from "node:crypto";
+import {
+  existsSync as existsSync3,
+  mkdirSync as mkdirSync3,
+  readFileSync as readFileSync2,
+  readdirSync,
+  statSync as statSync2,
+  unlinkSync as unlinkSync3,
+  writeFileSync as writeFileSync2
+} from "node:fs";
+import { resolve as resolve3 } from "node:path";
+
 // src/config.ts
 import { chmodSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync, writeFileSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
@@ -5017,6 +5030,270 @@ function doctor(opts = {}) {
   return payload;
 }
 
+// src/cache.ts
+var CACHE_TTL_SEC = {
+  search: 5 * 60,
+  discover: 30 * 60,
+  fetch: 60 * 60,
+  docs: 60 * 60
+};
+function blobsDir() {
+  return resolve3(cacheDir(), "blobs");
+}
+function blobPath(key) {
+  return resolve3(blobsDir(), key.slice(0, 2), key.slice(2, 4), `${key}.json`);
+}
+function sortKeys(value) {
+  if (Array.isArray(value))
+    return value.map(sortKeys);
+  if (value !== null && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value).sort()) {
+      out[k] = sortKeys(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+function cacheKey(parts) {
+  const canonical = JSON.stringify({
+    op: parts.op,
+    query: parts.query,
+    params: sortKeys(parts.params)
+  });
+  return createHash2("sha256").update(canonical, "utf8").digest("hex");
+}
+function cacheEnabled(noCache) {
+  if (noCache)
+    return false;
+  if (process.env.WSC_NO_CACHE === "1")
+    return false;
+  return true;
+}
+async function get(key, ttlSec, opts = {}) {
+  if (!cacheEnabled(opts.noCache))
+    return null;
+  if (ttlSec <= 0)
+    return null;
+  const path = blobPath(key);
+  if (!existsSync3(path))
+    return null;
+  let raw;
+  try {
+    raw = readFileSync2(path, "utf8");
+  } catch {
+    return null;
+  }
+  let env;
+  try {
+    env = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (env.expires_at && new Date(env.expires_at).getTime() < Date.now())
+    return null;
+  return env.value ?? null;
+}
+async function set(key, value, meta) {
+  if (!cacheEnabled(meta.noCache))
+    return;
+  if (meta.ttlSec <= 0)
+    return;
+  const path = blobPath(key);
+  const dir = resolve3(path, "..");
+  if (!existsSync3(dir))
+    mkdirSync3(dir, { recursive: true });
+  const cachedAt = new Date;
+  const expiresAt = new Date(cachedAt.getTime() + meta.ttlSec * 1000);
+  const env = {
+    cached_at: cachedAt.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    ttl_sec: meta.ttlSec,
+    key,
+    op: meta.op,
+    provider: meta.provider,
+    value
+  };
+  try {
+    writeFileSync2(path, JSON.stringify(env), "utf8");
+  } catch {}
+}
+function* walkBlobs() {
+  const root = blobsDir();
+  if (!existsSync3(root))
+    return;
+  let firstLevel;
+  try {
+    firstLevel = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const a of firstLevel) {
+    const aPath = resolve3(root, a);
+    let aStat;
+    try {
+      aStat = statSync2(aPath);
+    } catch {
+      continue;
+    }
+    if (!aStat.isDirectory())
+      continue;
+    let secondLevel;
+    try {
+      secondLevel = readdirSync(aPath);
+    } catch {
+      continue;
+    }
+    for (const b of secondLevel) {
+      const bPath = resolve3(aPath, b);
+      let bStat;
+      try {
+        bStat = statSync2(bPath);
+      } catch {
+        continue;
+      }
+      if (!bStat.isDirectory())
+        continue;
+      let files;
+      try {
+        files = readdirSync(bPath);
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        if (!f.endsWith(".json"))
+          continue;
+        const filePath = resolve3(bPath, f);
+        let fStat;
+        try {
+          fStat = statSync2(filePath);
+        } catch {
+          continue;
+        }
+        let env = null;
+        try {
+          env = JSON.parse(readFileSync2(filePath, "utf8"));
+        } catch {}
+        yield { path: filePath, size: fStat.size, env };
+      }
+    }
+  }
+}
+function stats() {
+  let count = 0;
+  let sizeBytes = 0;
+  const byOp = {};
+  const byProvider = {};
+  let oldest = null;
+  let newest = null;
+  let expiredCount = 0;
+  const now = Date.now();
+  for (const { size, env } of walkBlobs()) {
+    count += 1;
+    sizeBytes += size;
+    if (env) {
+      const op = env.op ?? "?";
+      const provider = env.provider ?? "?";
+      byOp[op] = (byOp[op] ?? 0) + 1;
+      byProvider[provider] = (byProvider[provider] ?? 0) + 1;
+      if (env.cached_at) {
+        if (oldest === null || env.cached_at < oldest)
+          oldest = env.cached_at;
+        if (newest === null || env.cached_at > newest)
+          newest = env.cached_at;
+      }
+      if (env.expires_at && new Date(env.expires_at).getTime() < now)
+        expiredCount += 1;
+    }
+  }
+  return {
+    ok: true,
+    operation: "cache.stats",
+    path: blobsDir(),
+    count,
+    size_bytes: sizeBytes,
+    size_human: humanSize(sizeBytes),
+    by_op: byOp,
+    by_provider: byProvider,
+    oldest,
+    newest,
+    expired_count: expiredCount,
+    returncode: 0
+  };
+}
+function clear(opts = {}) {
+  const hasConstraint = opts.olderThanSec != null || opts.expiredOnly === true || opts.op || opts.provider;
+  if (!opts.all && !hasConstraint) {
+    return {
+      ok: false,
+      operation: "cache.clear",
+      path: blobsDir(),
+      removed_count: 0,
+      removed_bytes: 0,
+      size_human: "0 B",
+      returncode: 2,
+      error: "wsc cache clear: refusing to clear everything without --all (or specify --older-than / --expired-only / --op / --provider)"
+    };
+  }
+  const now = Date.now();
+  const cutoff = opts.olderThanSec != null ? now - opts.olderThanSec * 1000 : null;
+  let removedCount = 0;
+  let removedBytes = 0;
+  for (const entry of walkBlobs()) {
+    const { path, size, env } = entry;
+    if (opts.op && env?.op !== opts.op)
+      continue;
+    if (opts.provider && env?.provider !== opts.provider)
+      continue;
+    let removeThis = false;
+    if (opts.all) {
+      removeThis = true;
+    } else if (opts.expiredOnly && env?.expires_at && new Date(env.expires_at).getTime() < now) {
+      removeThis = true;
+    } else if (cutoff !== null && env?.cached_at && new Date(env.cached_at).getTime() < cutoff) {
+      removeThis = true;
+    } else if ((opts.op || opts.provider) && !opts.expiredOnly && cutoff === null) {
+      removeThis = true;
+    }
+    if (removeThis) {
+      try {
+        unlinkSync3(path);
+        removedCount += 1;
+        removedBytes += size;
+      } catch {}
+    }
+  }
+  return {
+    ok: true,
+    operation: "cache.clear",
+    path: blobsDir(),
+    removed_count: removedCount,
+    removed_bytes: removedBytes,
+    size_human: humanSize(removedBytes),
+    returncode: 0
+  };
+}
+var DUR_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
+function parseDurationSec(spec) {
+  const trimmed = spec.trim().toLowerCase();
+  if (!trimmed)
+    throw new Error("empty duration");
+  const unit = trimmed.slice(-1);
+  if (!(unit in DUR_UNITS))
+    throw new Error(`unknown duration unit: ${spec} (use s/m/h/d)`);
+  const n = Number.parseFloat(trimmed.slice(0, -1));
+  if (Number.isNaN(n))
+    throw new Error(`invalid duration: ${spec}`);
+  return Math.floor(n * DUR_UNITS[unit]);
+}
+function humanSize(bytes) {
+  if (bytes < 1024)
+    return `${bytes} B`;
+  if (bytes < 1024 * 1024)
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 // src/providers/base.ts
 class NormalizedResult {
   url;
@@ -5903,6 +6180,11 @@ async function run2(query, opts = {}) {
   const category = opts.type ? TYPE_TO_EXA_CATEGORY[opts.type] : undefined;
   const framed = reframeForKeywordSearch(query, opts.type);
   const num = opts.numResults ?? 10;
+  const cKey = cacheKey({
+    op: "discover",
+    query,
+    params: { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num }
+  });
   const exaAction = (provider) => provider.search(query, {
     numResults: num,
     type: "auto",
@@ -5915,6 +6197,28 @@ async function run2(query, opts = {}) {
   return await withCall("discover", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(query));
     receipt.params = { type: opts.type ?? null, sinceDays: opts.sinceDays ?? null, numResults: num };
+    const cached = await get(cKey, CACHE_TTL_SEC.discover, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
+      receipt.results_count = cached.results.length;
+      receipt.selected_count = cached.results.length;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "discover",
+        provider: cached.provider,
+        query,
+        results: cached.results,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        returncode: 0
+      };
+    }
     const { active, result, fallback } = await runChain(chain, {
       exa: exaAction,
       tavily: tavilyAction,
@@ -5922,6 +6226,7 @@ async function run2(query, opts = {}) {
       duckduckgo: ddgAction
     });
     receipt.fallback_chain = fallback;
+    receipt.cache_hit = false;
     if (active === null || result === null) {
       receipt.status = "error";
       return await chainFailedPayload("discover", fallback);
@@ -5931,16 +6236,20 @@ async function run2(query, opts = {}) {
     receipt.selected_urls = urls;
     receipt.results_count = result.length;
     receipt.selected_count = result.length;
-    if (active !== chain[0])
+    const status = active !== chain[0] ? "degraded" : "ok";
+    if (status === "degraded")
       receipt.status = "degraded";
+    const resultsJson = result.map((r) => r.toJSON());
+    await set(cKey, { provider: active, results: resultsJson, fallback_chain: fallback, cached_status: status }, { ttlSec: CACHE_TTL_SEC.discover, op: "discover", provider: active, noCache: opts.noCache });
     return {
       ok: true,
       operation: "discover",
       provider: active,
       query,
-      results: result.map((r) => r.toJSON()),
+      results: resultsJson,
       fallback_chain: fallback,
-      status: active !== chain[0] ? "degraded" : "ok",
+      status,
+      cache_hit: false,
       returncode: 0
     };
   });
@@ -5965,6 +6274,11 @@ function reframeForKeywordSearch(query, type) {
 // src/ops/docs.ts
 async function run3(library, opts = {}) {
   const chain = filteredChain("library_docs");
+  const cKey = cacheKey({
+    op: "docs",
+    query: library,
+    params: { topic: opts.topic ?? null, version: opts.version ?? null }
+  });
   const context7Action = async (provider) => {
     const ctx = provider;
     const candidates = await ctx.resolveLibrary(library);
@@ -5996,11 +6310,37 @@ async function run3(library, opts = {}) {
   return await withCall("docs", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(library));
     receipt.params = { topic: opts.topic ?? null, version: opts.version ?? null };
+    const cached = await get(cKey, CACHE_TTL_SEC.docs, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      const cachedUrl = cached.page.url;
+      receipt.selected_urls = typeof cachedUrl === "string" ? [cachedUrl] : [];
+      receipt.selected_count = receipt.selected_urls.length;
+      receipt.results_count = receipt.selected_urls.length;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "docs",
+        provider: cached.provider,
+        library,
+        library_id: cached.library_id,
+        topic: opts.topic ?? null,
+        page: cached.page,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        returncode: 0
+      };
+    }
     const { active, result, fallback } = await runChain(chain, {
       context7: context7Action,
       firecrawl: firecrawlAction
     });
     receipt.fallback_chain = fallback;
+    receipt.cache_hit = false;
     if (active === null || result === null) {
       receipt.status = "error";
       const failed = await chainFailedPayload("docs", fallback);
@@ -6017,6 +6357,9 @@ async function run3(library, opts = {}) {
     receipt.results_count = 1;
     if (page.status === "degraded")
       receipt.status = "degraded";
+    const pageJson = page.toJSON();
+    const cachedStatus = page.status === "degraded" ? "degraded" : "ok";
+    await set(cKey, { provider: active, library_id: result.library_id, page: pageJson, fallback_chain: fallback, cached_status: cachedStatus }, { ttlSec: CACHE_TTL_SEC.docs, op: "docs", provider: active, noCache: opts.noCache });
     return {
       ok: true,
       operation: "docs",
@@ -6024,9 +6367,10 @@ async function run3(library, opts = {}) {
       library,
       library_id: result.library_id,
       topic: opts.topic ?? null,
-      page: page.toJSON(),
+      page: pageJson,
       fallback_chain: fallback,
       status: page.status,
+      cache_hit: false,
       returncode: 0
     };
   });
@@ -6058,12 +6402,40 @@ async function stdlibFetch(url) {
 }
 async function run4(url, opts = {}) {
   const chain = filteredChain("url_fetch");
+  const cKey = cacheKey({
+    op: "fetch",
+    query: url,
+    params: { formats: opts.formats ?? null, screenshot: !!opts.screenshot }
+  });
   const firecrawlAction = (provider) => provider.scrape(url, { formats: opts.formats, screenshot: opts.screenshot });
   return await withCall("fetch", { provider: "firecrawl", correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(url));
     receipt.params = { formats: opts.formats ?? null, screenshot: !!opts.screenshot };
+    const cached = await get(cKey, CACHE_TTL_SEC.fetch, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      const cachedUrl = cached.page.url;
+      receipt.selected_urls = typeof cachedUrl === "string" ? [cachedUrl] : [];
+      receipt.selected_count = receipt.selected_urls.length;
+      receipt.results_count = receipt.selected_urls.length;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "fetch",
+        provider: cached.provider,
+        page: cached.page,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        returncode: 0
+      };
+    }
     const { active, result, fallback } = await runChain(chain, { firecrawl: firecrawlAction });
     receipt.fallback_chain = [...fallback];
+    receipt.cache_hit = false;
     if (active === null || result === null) {
       try {
         const page = await stdlibFetch(url);
@@ -6077,13 +6449,16 @@ async function run4(url, opts = {}) {
         receipt.selected_urls = [page.url];
         receipt.selected_count = 1;
         receipt.results_count = 1;
+        const pageJson2 = page.toJSON();
+        await set(cKey, { provider: "urllib", page: pageJson2, fallback_chain: receipt.fallback_chain, cached_status: "degraded" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: "urllib", noCache: opts.noCache });
         return {
           ok: true,
           operation: "fetch",
           provider: "urllib",
-          page: page.toJSON(),
+          page: pageJson2,
           fallback_chain: receipt.fallback_chain,
           status: "degraded",
+          cache_hit: false,
           returncode: 0
         };
       } catch (err) {
@@ -6108,13 +6483,17 @@ async function run4(url, opts = {}) {
     receipt.selected_urls = result.url ? [result.url] : [];
     receipt.selected_count = 1;
     receipt.results_count = 1;
+    const pageJson = result.toJSON();
+    const status = result.status;
+    await set(cKey, { provider: active, page: pageJson, fallback_chain: fallback, cached_status: status === "degraded" ? "degraded" : "ok" }, { ttlSec: CACHE_TTL_SEC.fetch, op: "fetch", provider: active, noCache: opts.noCache });
     return {
       ok: true,
       operation: "fetch",
       provider: active,
-      page: result.toJSON(),
+      page: pageJson,
       fallback_chain: receipt.fallback_chain,
       status: result.status,
+      cache_hit: false,
       returncode: 0
     };
   });
@@ -6349,6 +6728,11 @@ var TIME_TO_BRAVE_FRESHNESS = { day: "pd", week: "pw", month: "pm", year: "py" }
 async function run5(query, opts = {}) {
   const chain = filteredChain("web_facts");
   const max = opts.maxResults ?? 10;
+  const cKey = cacheKey({
+    op: "search",
+    query,
+    params: { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null }
+  });
   const tavilyAction = (provider) => provider.search(query, {
     maxResults: max,
     searchDepth: "basic",
@@ -6365,12 +6749,35 @@ async function run5(query, opts = {}) {
   return await withCall("search", { provider: chain[0] ?? null, correlationId: opts.correlationId, noReceipt: opts.noReceipt }, async (receipt) => {
     Object.assign(receipt, queryFingerprint(query));
     receipt.params = { max_results: max, time_range: opts.timeRange ?? null, country: opts.country ?? null };
+    const cached = await get(cKey, CACHE_TTL_SEC.search, { noCache: opts.noCache });
+    if (cached) {
+      receipt.cache_hit = true;
+      receipt.provider = cached.provider;
+      receipt.fallback_chain = cached.fallback_chain;
+      receipt.selected_urls = cached.results.map((r) => String(r.url ?? ""));
+      receipt.results_count = cached.results.length;
+      receipt.selected_count = cached.results.length;
+      if (cached.cached_status === "degraded")
+        receipt.status = "degraded";
+      return {
+        ok: true,
+        operation: "search",
+        provider: cached.provider,
+        query,
+        results: cached.results,
+        fallback_chain: cached.fallback_chain,
+        status: cached.cached_status,
+        cache_hit: true,
+        returncode: 0
+      };
+    }
     const { active, result, fallback } = await runChain(chain, {
       tavily: tavilyAction,
       brave: braveAction,
       duckduckgo: ddgAction
     });
     receipt.fallback_chain = fallback;
+    receipt.cache_hit = false;
     if (active === null || result === null) {
       receipt.status = "error";
       return await chainFailedPayload("search", fallback);
@@ -6380,16 +6787,20 @@ async function run5(query, opts = {}) {
     receipt.selected_urls = urls;
     receipt.results_count = result.length;
     receipt.selected_count = result.length;
-    if (active !== chain[0])
+    const status = active !== chain[0] ? "degraded" : "ok";
+    if (status === "degraded")
       receipt.status = "degraded";
+    const resultsJson = result.map((r) => r.toJSON());
+    await set(cKey, { provider: active, results: resultsJson, fallback_chain: fallback, cached_status: status }, { ttlSec: CACHE_TTL_SEC.search, op: "search", provider: active, noCache: opts.noCache });
     return {
       ok: true,
       operation: "search",
       provider: active,
       query,
-      results: result.map((r) => r.toJSON()),
+      results: resultsJson,
       fallback_chain: fallback,
-      status: active !== chain[0] ? "degraded" : "ok",
+      status,
+      cache_hit: false,
       returncode: 0
     };
   });
@@ -6528,6 +6939,18 @@ function renderHuman(payload) {
     renderPlanExplain(payload);
     return;
   }
+  if (op === "cache.stats") {
+    renderCacheStats(payload);
+    return;
+  }
+  if (op === "cache.clear") {
+    if (payload.error)
+      process.stderr.write(`${payload.error}
+`);
+    else
+      console.log(`removed ${payload.removed_count ?? 0} entries (${payload.size_human ?? "0 B"})`);
+    return;
+  }
   process.stdout.write(JSON.stringify(payload, null, 2) + `
 `);
 }
@@ -6582,6 +7005,28 @@ function renderReceiptsSummary(payload) {
   if (high.length > 0)
     console.log(`  high-confidence events: ${high.length}`);
 }
+function renderCacheStats(payload) {
+  console.log(`cache  count=${payload.count ?? 0}  size=${payload.size_human ?? "0 B"}  expired=${payload.expired_count ?? 0}`);
+  const oldest = payload.oldest;
+  const newest = payload.newest;
+  if (oldest)
+    console.log(`  oldest: ${oldest}`);
+  if (newest)
+    console.log(`  newest: ${newest}`);
+  for (const [label, key] of [
+    ["by op", "by_op"],
+    ["by provider", "by_provider"]
+  ]) {
+    const d = payload[key] ?? {};
+    if (Object.keys(d).length > 0) {
+      console.log(`  ${label}:`);
+      for (const [k, v] of Object.entries(d).sort(([, a], [, b]) => b - a)) {
+        console.log(`    ${String(v).padStart(5)}  ${k}`);
+      }
+    }
+  }
+  console.log(`  path: ${payload.path ?? ""}`);
+}
 function renderPlanExplain(payload) {
   const d = payload.decision ?? {};
   console.log(`query: ${JSON.stringify(payload.query)}`);
@@ -6606,9 +7051,16 @@ function renderPlanExplain(payload) {
 would run: ${payload.would_run}`);
 }
 var program2 = new Command;
-program2.name("wsc").description("Unified evidence-acquisition CLI across Context7, Exa, Tavily, Firecrawl, Brave, and DuckDuckGo.").version(VERSION, "-v, --version", "print version and exit").option("--json", "emit machine-readable JSON (auto-on when stdout is not a TTY or WSC_JSON=1)").option("--quiet", "suppress human-mode chatter").option("--no-receipt", "skip audit log write").option("--budget <n>", "override per-task search budget", (v) => Number.parseInt(v, 10));
+program2.name("wsc").description("Unified evidence-acquisition CLI across Context7, Exa, Tavily, Firecrawl, Brave, and DuckDuckGo.").version(VERSION, "-v, --version", "print version and exit").option("--json", "emit machine-readable JSON (auto-on when stdout is not a TTY or WSC_JSON=1)").option("--quiet", "suppress human-mode chatter").option("--no-receipt", "skip audit log write").option("--no-cache", "skip cache read/write (also: WSC_NO_CACHE=1)").option("--budget <n>", "override per-task search budget", (v) => Number.parseInt(v, 10));
 function getGlobals() {
-  return program2.opts();
+  const raw = program2.opts();
+  return {
+    json: raw.json,
+    quiet: raw.quiet,
+    noReceipt: raw.receipt === false,
+    noCache: raw.cache === false,
+    budget: raw.budget
+  };
 }
 program2.command("init").description("create config + state dirs and templates").option("--force", "overwrite existing keys.toml / budget.toml").option("--yes", "non-interactive (no prompts; v0.2 always non-interactive)").action((opts) => {
   emit(getGlobals(), { ...init({ force: !!opts.force }) });
@@ -6656,6 +7108,32 @@ rec.command("summary").description("aggregated audit summary").option("--days <n
   });
   emit(getGlobals(), result);
 });
+var ca = program2.command("cache").description("content-addressed response cache");
+ca.command("stats").description("show cache size, count, per-op breakdown, expired entries").action(() => {
+  emit(getGlobals(), stats());
+});
+ca.command("clear").description("remove cached entries (refuses without --all or a filter)").option("--all", "remove every cached entry (still respects --op / --provider filters)").option("--older-than <duration>", "remove entries cached more than this ago (e.g. 5m, 2h, 1d)").option("--expired-only", "remove only entries past their TTL").option("--op <name>", "filter by op (search|discover|fetch|docs)").option("--provider <name>", "filter by provider (tavily|brave|exa|firecrawl|context7|urllib)").action((opts) => {
+  let olderThanSec;
+  try {
+    if (opts.olderThan)
+      olderThanSec = parseDurationSec(opts.olderThan);
+  } catch (err) {
+    emit(getGlobals(), {
+      ok: false,
+      operation: "cache.clear",
+      error: err instanceof Error ? err.message : String(err),
+      returncode: 2
+    });
+  }
+  const result = clear({
+    all: !!opts.all,
+    olderThanSec,
+    expiredOnly: !!opts.expiredOnly,
+    op: opts.op,
+    provider: opts.provider
+  });
+  emit(getGlobals(), result);
+});
 program2.command("plan <query>").description("auto-route a query to the right tool").option("--explain", "show route decision without calling providers").addOption(new Option("--prefer <mode>", "fast|deep").choices(["fast", "deep"])).addOption(new Option("--router <name>", "rule|llm").choices(["rule", "llm"]).default("rule")).action(async (query, opts) => {
   const globals = getGlobals();
   if (opts.explain) {
@@ -6670,29 +7148,35 @@ program2.command("plan <query>").description("auto-route a query to the right to
   emit(globals, result);
 });
 program2.command("docs <library>").description("fetch official library docs via Context7").option("--topic <topic>").option("--version <ver>").action(async (library, opts) => {
+  const globals = getGlobals();
   const result = await run3(library, {
     topic: opts.topic,
     version: opts.version,
-    noReceipt: getGlobals().noReceipt
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
   });
-  emit(getGlobals(), result);
+  emit(globals, result);
 });
 program2.command("discover <query>").description("semantic discovery via Exa").addOption(new Option("--type <kind>", "code|paper|company|people").choices(["code", "paper", "company", "people"])).option("--since <days>", "restrict to last N days", (v) => Number.parseInt(v, 10)).option("--num-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).action(async (query, opts) => {
+  const globals = getGlobals();
   const result = await run2(query, {
     type: opts.type,
     sinceDays: opts.since,
     numResults: opts.numResults,
-    noReceipt: getGlobals().noReceipt
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
   });
-  emit(getGlobals(), result);
+  emit(globals, result);
 });
 program2.command("fetch <url>").description("clean a known URL via Firecrawl").option("--format <fmt>", "markdown|html (repeatable)", (val, prev = []) => [...prev, val], []).option("--screenshot").action(async (url, opts) => {
+  const globals = getGlobals();
   const result = await run4(url, {
     formats: opts.format && opts.format.length > 0 ? opts.format : undefined,
     screenshot: !!opts.screenshot,
-    noReceipt: getGlobals().noReceipt
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
   });
-  emit(getGlobals(), result);
+  emit(globals, result);
 });
 program2.command("crawl <url>").description("crawl a site via Firecrawl (gated)").option("--max-pages <n>", "default 10", (v) => Number.parseInt(v, 10), 10).option("--include-paths <path>", "repeatable", (val, prev = []) => [...prev, val], []).option("--exclude-paths <path>", "repeatable", (val, prev = []) => [...prev, val], []).option("--format <fmt>", "repeatable", (val, prev = []) => [...prev, val], []).option("--apply", "required for crawls of 11–100 pages").option("--i-know-this-burns-credits", "required for crawls > 100 pages").action(async (url, opts) => {
   const result = await run(url, {
@@ -6707,13 +7191,15 @@ program2.command("crawl <url>").description("crawl a site via Firecrawl (gated)"
   emit(getGlobals(), result);
 });
 program2.command("search <query>").description("general web search via Tavily").option("--max-results <n>", "default 10", (v) => Number.parseInt(v, 10), 10).addOption(new Option("--time <range>", "day|week|month|year").choices(["day", "week", "month", "year"])).option("--country <code>").action(async (query, opts) => {
+  const globals = getGlobals();
   const result = await run5(query, {
     maxResults: opts.maxResults,
     timeRange: opts.time,
     country: opts.country,
-    noReceipt: getGlobals().noReceipt
+    noReceipt: globals.noReceipt,
+    noCache: globals.noCache
   });
-  emit(getGlobals(), result);
+  emit(globals, result);
 });
 program2.parseAsync().catch((err) => {
   const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);

@@ -57,6 +57,7 @@ Every call writes one JSON line to `~/.local/state/wsc/audit.jsonl` with:
 - `query_hash` + `query_preview` (no full query plaintext; redaction by design)
 - `selected_urls` (with secret query params stripped)
 - `results_count`, `selected_count`, `duration_ms`
+- `cache_hit` (boolean) — true when the response came from the local cache
 - `route_decision` (for `plan` only) — full classifier output incl. confidence + ambiguous
 
 Read recent activity:
@@ -66,6 +67,37 @@ wsc receipts tail --lines 20 --json
 wsc receipts summary --days 7 --by-domain --cost
 wsc receipts tail --tool fetch --since 1h
 ```
+
+## Cache (v0.3)
+
+`wsc` keeps a content-addressed cache at `~/.cache/wsc/blobs/` for every successful `search`, `discover`, `fetch`, and `docs` response. Repeating the same query within the TTL window is **free** (no provider HTTP, `cache_hit: true` recorded in the receipt).
+
+| Op       | TTL     | Why |
+|----------|---------|-----|
+| search   | 5 min   | News / pricing changes fast |
+| discover | 30 min  | Semantic candidate set is more stable |
+| fetch    | 1 hour  | Page bodies change less than headlines |
+| docs     | 1 hour  | Library docs barely move within the hour |
+| crawl    | not cached | Multi-page state, re-run is the contract |
+
+Behaviour rules for Claude:
+
+- **Don't manually deduplicate.** If the user asks the same question twice, just call `wsc` again — the cache handles it. Don't store wsc results in your own context "to save calls".
+- **If freshness matters more than cost** (release announcement, breaking news, "what changed in the last hour"), pass `--no-cache` (or set `WSC_NO_CACHE=1`).
+- **A `cache_hit: true` receipt is not a degraded result** — the original `provider` and `fallback_chain` are preserved from when the entry was first written. Treat it the same as a fresh ok response.
+- **`receipts summary --cost` reflects only un-cached calls** — if your total looks suspiciously low after a busy session, run `wsc cache stats` to see the cache size.
+
+Cache management:
+
+```bash
+wsc cache stats                                  # count, total size, expired entries, breakdown by op/provider
+wsc cache clear --expired-only                   # tidy garbage
+wsc cache clear --provider tavily                # nuke after key rotation
+wsc cache clear --older-than 1h                  # invalidate stale-ish entries
+wsc cache clear --all                            # nuclear (still respects --op / --provider filter)
+```
+
+`wsc cache clear` refuses to run with no flags — pass `--all`, `--older-than`, `--expired-only`, `--op`, or `--provider` explicitly.
 
 ## Common Recipes
 

@@ -208,3 +208,58 @@ describe("receipt redaction", () => {
     expect(raw).toContain("q=ok");
   });
 });
+
+// --- cache --------------------------------------------------------------
+
+describe("cache hit on repeat", () => {
+  test("second search call with same query short-circuits to cache_hit=true", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    let httpCalls = 0;
+    const handler = () => {
+      httpCalls += 1;
+      return jsonResponse({
+        results: [{ url: "https://a.com", title: "A", content: "x", score: 0.9 }],
+      });
+    };
+    const first = await withFakeFetch(handler, () => searchOp.run("hello-cache-test"));
+    expect(first.cache_hit).toBe(false);
+    expect(first.provider).toBe("tavily");
+    const second = await withFakeFetch(handler, () => searchOp.run("hello-cache-test"));
+    expect(second.cache_hit).toBe(true);
+    expect(second.provider).toBe("tavily");
+    expect(httpCalls).toBe(1);
+    const events = (await audit.tail({ lines: 5 })).events;
+    const last = events[events.length - 1]!;
+    expect(last.op).toBe("search");
+    expect(last.cache_hit).toBe(true);
+  });
+
+  test("--no-cache (noCache opt) bypasses cache on both read and write", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    let httpCalls = 0;
+    const handler = () => {
+      httpCalls += 1;
+      return jsonResponse({
+        results: [{ url: "https://a.com", title: "A", content: "x", score: 0.9 }],
+      });
+    };
+    await withFakeFetch(handler, () => searchOp.run("nocache-q", { noCache: true }));
+    const second = await withFakeFetch(handler, () => searchOp.run("nocache-q", { noCache: true }));
+    expect(second.cache_hit).toBe(false);
+    expect(httpCalls).toBe(2);
+  });
+
+  test("differing params produce distinct cache keys", async () => {
+    process.env.TAVILY_API_KEY = "tvly_test";
+    let httpCalls = 0;
+    const handler = () => {
+      httpCalls += 1;
+      return jsonResponse({
+        results: [{ url: "https://a.com", title: "A", content: "x", score: 0.9 }],
+      });
+    };
+    await withFakeFetch(handler, () => searchOp.run("same-query", { timeRange: "day" }));
+    await withFakeFetch(handler, () => searchOp.run("same-query", { timeRange: "week" }));
+    expect(httpCalls).toBe(2);
+  });
+});
