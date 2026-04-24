@@ -24,6 +24,13 @@ The plugin teaches Claude *when* to call the CLI; the CLI does the actual work. 
 
 ---
 
+## What's new in v0.4
+
+- **MCP server** (`wsc mcp`) — `wsc` now exposes its 9 ops as MCP tools. Configure once per agent and forget; the model gets typed tools with routing / cross-validation / citation guidance embedded in each tool's description. Supported: Claude Code, Claude Desktop, opencode, codex, Cursor, Cline, Continue, and any other MCP-aware client.
+- **AGENTS.md** at repo root — agent-agnostic prose guidance for tools that follow the [agents.md convention](https://agents.md) (opencode, codex, aider, Cursor rules) or any agent reading project markdown for instructions. Mirrors the Claude Code SKILL.md but free of Claude-specific idioms.
+
+See "Connect from any agent (MCP)" below for setup snippets.
+
 ## What's new in v0.3
 
 Built in response to a real-world dogfooding session that exposed three weaknesses:
@@ -49,6 +56,60 @@ Headline features:
 Receipt schema gains: `cache_hit`, `multi_source_evidence: [{provider, score}]`, `verified_urls: [{url, sha256, fetched_at, status}]`, `urls: [...]` for batch ops, `rejected: [{url, reason}]` for dedup losses.
 
 ---
+
+## Connect from any agent (MCP)
+
+`wsc mcp` runs `wsc` as an MCP server over stdio JSON-RPC. Any MCP-aware agent can drive the same 9 tools (`wsc_plan`, `wsc_search`, `wsc_discover`, `wsc_fetch`, `wsc_verify`, `wsc_deepdive`, `wsc_docs`, `wsc_receipts_tail`, `wsc_cache_stats`) — each carries the routing rule, cross-validation guidance, and citation discipline in its description, so the model gets the same instructions Claude Code's SKILL.md provides.
+
+**Claude Code:**
+
+```bash
+claude mcp add wsc -- wsc mcp
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "wsc": { "command": "wsc", "args": ["mcp"] }
+  }
+}
+```
+
+**opencode** (`~/.config/opencode/config.json`):
+
+```json
+{
+  "mcp": {
+    "wsc": { "type": "local", "command": ["wsc", "mcp"] }
+  }
+}
+```
+
+**codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.wsc]
+command = "wsc"
+args = ["mcp"]
+```
+
+**Cursor** (`.cursor/mcp.json` for project, or `~/.cursor/mcp.json` for global):
+
+```json
+{
+  "mcpServers": {
+    "wsc": { "command": "wsc", "args": ["mcp"] }
+  }
+}
+```
+
+**Cline / Continue** (each has its own `mcpServers` config block — same `{ command: "wsc", args: ["mcp"] }` shape).
+
+After adding, ask the agent something like "what's new in claude opus 4.7 — verify before citing" and it will pick `wsc_search` followed by `wsc_verify` (or just `wsc_deepdive`) on its own. The receipt path stays the same: `~/.local/state/wsc/audit.jsonl`.
+
+For agents that don't speak MCP (aider, raw shell agents), point them at `AGENTS.md` in this repo (or copy it into the project root) — the same routing / citation / confidence rules in pure prose.
 
 ## For Claude Code users — quickstart
 
@@ -205,6 +266,9 @@ wsc deepdive <query> [--depth shallow|standard|deep] [--time week|month]
 # Auto-route
 wsc plan <query> [--budget N] [--prefer fast|deep] [--explain] [--router rule|llm]
 
+# MCP server (for any MCP-aware agent — see "Connect from any agent")
+wsc mcp                                        # stdio JSON-RPC; configure once per agent
+
 # Audit
 wsc receipts tail [--lines N] [--tool TOOL] [--since 1h] [--provider X]
 wsc receipts summary [--days N] [--by-domain] [--cost] [--high-confidence]
@@ -243,7 +307,7 @@ wsc receipts tail --lines 1 | jq '.correlation_id'   # equals the UUID
 git clone https://github.com/heggria/web-surfing-cli
 cd web-surfing-cli
 bun install
-bun test                  # 166 tests
+bun test                  # 172 tests
 bun run lint              # tsc --noEmit
 bun run dev -- --version  # run the CLI from source
 bun run build             # build dist/cli.mjs (npm bundle)
@@ -254,20 +318,18 @@ bun run build:bin         # build all four single-binary targets
 
 ## Status
 
-**v0.3 GA.** All v0.2-deferred items shipped:
+**v0.4 GA.** New in v0.4: MCP server (`wsc mcp`) so any MCP-aware agent (Claude Code, Claude Desktop, opencode, codex, Cursor, Cline, Continue) can drive `wsc` with the same routing/citation guidance built into each tool description; `AGENTS.md` for agents that don't speak MCP (aider, raw CLI agents, Cursor rules).
 
-- ✅ Content-addressed cache (`~/.cache/wsc/blobs/`) — receipt field `cache_hit` populated; per-op TTL.
-- ✅ Cross-provider corroboration with `multi_source_evidence` aggregation; `--corroborate N` flag; `corroborated_by` per result.
-- ✅ Citation discipline via `wsc verify` + `wsc deepdive` (sha256 + fetched_at proof).
-- ✅ Batch `wsc fetch URL1 URL2 ...` with concurrent execution and parent_call_id linkage.
-- ✅ Tavily Extract integrated as `fetch` chain middle fallback.
-- ✅ Domain filtering (`--source` presets + `--include-domain`).
+Shipped earlier:
 
-Reserved for v0.4:
+- ✅ v0.3: Content-addressed cache, `--corroborate` cross-validation, `wsc verify` + `wsc deepdive`, batch `wsc fetch`, Tavily Extract fallback, `--source` / `--include-domain`, discussions/opinions routing.
+- ✅ v0.2: TypeScript/Bun rewrite, plugin marketplace, audit receipts, kill-switch.
+
+Reserved for later:
 
 - LLM-backed router (`--router llm`) — scaffold present, throws today.
 - `wsc config doctor --deep` real probes (currently returns `skipped`).
-- `wsc summarize` / `wsc digest` LLM-summarization wrappers (cache + verify must be solid first).
+- `wsc summarize` / `wsc digest` LLM-summarization wrappers.
 
 ---
 

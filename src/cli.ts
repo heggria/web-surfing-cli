@@ -20,7 +20,7 @@ import * as search from "./ops/search.js";
 import * as verify from "./ops/verify.js";
 import { resolveIncludeDomains } from "./domains.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 interface GlobalOptions {
   json?: boolean;
@@ -346,6 +346,15 @@ ca
       provider: opts.provider,
     });
     emit(getGlobals(), result as unknown as Record<string, unknown>);
+  });
+
+// mcp — run as an MCP server over stdio
+program
+  .command("mcp")
+  .description("run wsc as an MCP server (stdio JSON-RPC); add to Claude Code / Claude Desktop / opencode / codex / Cursor / Cline / Continue config")
+  .action(async () => {
+    const { runMcpServer } = await import("./mcp.js");
+    await runMcpServer(VERSION);
   });
 
 // plan

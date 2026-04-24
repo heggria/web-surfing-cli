@@ -1,6 +1,6 @@
 {
   "name": "web-surfing-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Routing-policy-driven web research CLI across Context7, Exa, Tavily, Firecrawl, Brave, and DuckDuckGo with audit receipts. Companion Claude Code plugin marketplace included.",
   "type": "module",
   "license": "MIT",
@@ -46,6 +46,7 @@
     "dev": "bun run src/cli.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^12.1.0",
     "proper-lockfile": "^4.1.2",
     "smol-toml": "^1.3.1"
